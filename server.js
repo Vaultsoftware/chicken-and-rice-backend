@@ -15,7 +15,40 @@ import { fileURLToPath } from "url";
 import { upload, sanitizeName } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
-// Routes
+// ---- App & Express v6 wildcard-compat shim (fix legacy `/*` routes) ----
+const app = express();
+app.set("trust proxy", 1);
+
+function v6CompatPath(p) {
+  if (typeof p !== "string") return p;
+  // bare "*" or "/*" → named wildcard
+  if (p === "*" || p === "/*") return "/:__v6_wild(*)";
+  // any "/something/*" segment(s) → "/something/:__v6_wild(*)"
+  return p.replace(/\/\*(?=\/|$)/g, "/:__v6_wild(*)");
+}
+function wrapMethods(target) {
+  const methods = ["get","post","put","patch","delete","options","head","use","all"];
+  for (const m of methods) {
+    const orig = target[m]?.bind(target);
+    if (!orig) continue;
+    target[m] = (first, ...rest) => {
+      const patched = typeof first === "string" ? v6CompatPath(first) : first;
+      return orig(patched, ...rest);
+    };
+  }
+}
+wrapMethods(app);
+
+// patch Router() factory so every router gets the shim too
+const _Router = express.Router;
+express.Router = function (...args) {
+  const r = _Router.apply(express, args);
+  wrapMethods(r);
+  return r;
+};
+// -----------------------------------------------------------------------
+
+// Routes (imports after shim so they inherit patched Router)
 import foodRoutes from "./routes/foodRoutes.js";
 import orderRoutes from "./routes/orders.js";
 import deliverymanRoutes from "./routes/deliverymanRoutes.js";
@@ -28,9 +61,6 @@ import emailRoutes from "./routes/emailRoutes.js";
 import drinkRoutes from "./routes/drinkRoutes.js";
 // NEW
 import inventoryRoutes from "./routes/inventory.js";
-
-const app = express();
-app.set("trust proxy", 1);
 
 // Firebase once
 try {
@@ -76,7 +106,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 /**
- * Firebase-backed /uploads — Express 5 requires a named wildcard.
+ * Firebase-backed /uploads — Express 5 safe wildcard.
  * Keeps existing URLs: GET /uploads/<filename or nested/path>
  */
 app.get("/uploads/:path(*)", async (req, res) => {
@@ -186,7 +216,7 @@ mongoose
         if (idx.name === "_id_") continue;
         if (isSlugSingleField(idx) && idx.unique) continue;
 
-        const keys = idx.key ? Object.keys(idx.key) : [];
+      const keys = idx.key ? Object.keys(idx.key) : [];
         const referencesSkuOrName = keys.some((k) => /^(sku|name)/i.test(k));
         const nonUniqueSlugSingle = isSlugSingleField(idx) && !idx.unique;
 
