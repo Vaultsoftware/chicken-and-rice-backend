@@ -76,10 +76,10 @@ app.use(
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ✅ FIXED Express 5-compatible wildcard route
-app.get("/uploads/:path(*)", async (req, res) => {
+// Firebase-backed /uploads (preserves existing URLs)
+app.get("/uploads/*", async (req, res) => {
   try {
-    const rel = req.params.path || "";
+    const rel = req.params?.[0] || "";
     if (!rel) return res.status(404).end();
 
     const info = await statObject(rel);
