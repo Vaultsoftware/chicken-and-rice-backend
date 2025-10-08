@@ -1,4 +1,8 @@
 // backend/middleware/upload.js
+/**
+ * In-memory uploads to avoid Fly volumes; buffers go straight to Firebase.
+ * Keep filename sanitization stable so existing URLs remain predictable.
+ */
 import multer from "multer";
 import path from "path";
 
@@ -9,10 +13,9 @@ export function sanitizeName(original) {
   return `${Date.now()}-${safe || "file"}${ext || ""}`;
 }
 
-// In-memory; no disk/volume usage
 const storage = multer.memoryStorage();
 
 export const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  limits: { fileSize: 20 * 1024 * 1024 }, // keep server memory safe
 });

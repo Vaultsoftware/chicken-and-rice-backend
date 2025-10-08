@@ -1,7 +1,7 @@
 // backend/server.js
 import "dotenv/config";
 
-// Pin TZ (unchanged)
+// TZ pin
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
 import express from "express";
@@ -32,7 +32,7 @@ import inventoryRoutes from "./routes/inventory.js";
 const app = express();
 app.set("trust proxy", 1);
 
-// Init Firebase once
+// Firebase once
 try {
   initFirebase();
   console.log("✅ Firebase initialized");
@@ -45,7 +45,7 @@ try {
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// CORS (unchanged)
+// CORS
 const allowedOrigins = [
   "https://chickenandrice.net",
   "https://www.chickenandrice.net",
@@ -71,15 +71,17 @@ app.use(
   })
 );
 
-// Static uploads: replaced with Firebase-backed streaming route.
-// Keep __dirname calc (may be used elsewhere)
+// __dirname (retained)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Firebase-backed /uploads (preserves existing URLs)
-app.get("/uploads/*", async (req, res) => {
+/**
+ * Firebase-backed /uploads — Express 5 requires a named wildcard.
+ * Keeps existing URLs: GET /uploads/<filename or nested/path>
+ */
+app.get("/uploads/:path(*)", async (req, res) => {
   try {
-    const rel = req.params?.[0] || "";
+    const rel = req.params?.path || "";
     if (!rel) return res.status(404).end();
 
     const info = await statObject(rel);
@@ -125,7 +127,7 @@ app.get("/__diag/ping", async (_req, res) => {
   }
 });
 
-// Simple upload smoke-test to Firebase
+// In-memory upload → Firebase
 app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "no file" });
@@ -148,7 +150,7 @@ app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// TZ diag (unchanged)
+// TZ diag
 app.get("/__diag/time", (_req, res) => {
   const now = new Date();
   const start = new Date(now);
@@ -160,7 +162,7 @@ app.get("/__diag/time", (_req, res) => {
   });
 });
 
-// Mongo (unchanged)
+// Mongo
 if (!process.env.MONGO_URI) console.error("❌ MONGO_URI is not set");
 if (!process.env.JWT_SECRET) console.warn("⚠️ JWT_SECRET is not set");
 
@@ -169,7 +171,7 @@ mongoose
   .then(async () => {
     console.log("✅ MongoDB connected");
 
-    // 🧹 index housekeeping (unchanged)
+    // inventory index housekeeping (retained)
     try {
       const coll = mongoose.connection.db.collection("inventoryitems");
       const indexes = await coll.indexes();
@@ -216,7 +218,7 @@ mongoose
     process.exit(1);
   });
 
-// Root + protected (unchanged)
+// Root + protected
 app.get("/", (_req, res) =>
   res.json({ message: "Welcome to Chicken & Rice API 🍚🍗" })
 );
@@ -230,7 +232,7 @@ app.get("/api/protected", (req, res) => {
   });
 });
 
-// Routes (unchanged)
+// API routes
 app.use("/api/foods", foodRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/delivery", deliverymanRoutes);
@@ -244,7 +246,7 @@ app.use("/api/drinks", drinkRoutes);
 // NEW
 app.use("/api/inventory", inventoryRoutes);
 
-// Error handler (unchanged)
+// Error handler
 app.use((err, _req, res, _next) => {
   console.error("⚠️ Server error:", err?.message || err);
   res.status(500).json({ error: "Something went wrong" });
