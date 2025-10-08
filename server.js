@@ -1,7 +1,6 @@
 // backend/server.js
 import "dotenv/config";
 
-// Pin TZ (unchanged)
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
 import express from "express";
@@ -26,26 +25,26 @@ import drinkPopRoutes from "./routes/drinkPopRoutes.js";
 import proteinPopRoutes from "./routes/proteinPopRoutes.js";
 import emailRoutes from "./routes/emailRoutes.js";
 import drinkRoutes from "./routes/drinkRoutes.js";
-// NEW
 import inventoryRoutes from "./routes/inventory.js";
 
 const app = express();
 app.set("trust proxy", 1);
 
-// Init Firebase once
+// ✅ Firebase init safety: don’t crash if secrets missing
 try {
-  initFirebase();
-  console.log("✅ Firebase initialized");
+  const firebaseApp = initFirebase();
+  if (firebaseApp) console.log("✅ Firebase initialized");
+  else console.warn("⚠️ Firebase not initialized (missing credentials)");
 } catch (e) {
   console.error("❌ Firebase init failed:", e?.message || e);
-  process.exit(1);
+  // Don’t exit — continue running for /healthz visibility
 }
 
-// body parsing
+// Body parsing
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// CORS (unchanged)
+// ✅ CORS
 const allowedOrigins = [
   "https://chickenandrice.net",
   "https://www.chickenandrice.net",
@@ -71,12 +70,10 @@ app.use(
   })
 );
 
-// Static uploads: replaced with Firebase-backed streaming route.
-// Keep __dirname calc (may be used elsewhere)
+// Static Firebase-backed uploads
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Firebase-backed /uploads (preserves existing URLs)
 app.get("/uploads/*", async (req, res) => {
   try {
     const rel = req.params?.[0] || "";
@@ -104,7 +101,7 @@ app.get("/uploads/*", async (req, res) => {
   }
 });
 
-// Health/diagnostics
+// Health diagnostics
 app.get("/healthz", (_req, res) => {
   const ok = Boolean(process.env.MONGO_URI) && Boolean(process.env.JWT_SECRET);
   const bucket = getBucket();
@@ -125,7 +122,6 @@ app.get("/__diag/ping", async (_req, res) => {
   }
 });
 
-// Simple upload smoke-test to Firebase
 app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "no file" });
@@ -148,7 +144,6 @@ app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// TZ diag (unchanged)
 app.get("/__diag/time", (_req, res) => {
   const now = new Date();
   const start = new Date(now);
@@ -160,63 +155,27 @@ app.get("/__diag/time", (_req, res) => {
   });
 });
 
-// Mongo (unchanged)
+// MongoDB Connection (with retry)
 if (!process.env.MONGO_URI) console.error("❌ MONGO_URI is not set");
 if (!process.env.JWT_SECRET) console.warn("⚠️ JWT_SECRET is not set");
 
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(async () => {
-    console.log("✅ MongoDB connected");
-
-    // 🧹 index housekeeping (unchanged)
+async function connectMongo(retries = 5, delay = 5000) {
+  for (let i = 0; i < retries; i++) {
     try {
-      const coll = mongoose.connection.db.collection("inventoryitems");
-      const indexes = await coll.indexes();
-
-      const isSlugSingleField = (idx) =>
-        idx &&
-        idx.key &&
-        Object.keys(idx.key).length === 1 &&
-        Object.prototype.hasOwnProperty.call(idx.key, "slug");
-
-      for (const idx of indexes) {
-        if (idx.name === "_id_") continue;
-        if (isSlugSingleField(idx) && idx.unique) continue;
-
-        const keys = idx.key ? Object.keys(idx.key) : [];
-        const referencesSkuOrName = keys.some((k) => /^(sku|name)/i.test(k));
-        const nonUniqueSlugSingle = isSlugSingleField(idx) && !idx.unique;
-
-        if (referencesSkuOrName || nonUniqueSlugSingle) {
-          await coll.dropIndex(idx.name);
-          console.log(
-            `🧹 Dropped legacy index inventoryitems.${idx.name} (${JSON.stringify(
-              idx.key
-            )})`
-          );
-        }
-      }
-
-      const fresh = await coll.indexes();
-      const hasUniqueSlug = fresh.some((i) => isSlugSingleField(i) && i.unique);
-      if (!hasUniqueSlug) {
-        await coll.createIndex({ slug: 1 }, { unique: true, name: "slug_1" });
-        console.log("✅ Ensured unique index inventoryitems.slug_1");
-      }
-    } catch (e) {
-      console.warn(
-        "⚠️ Could not clean/ensure indexes on inventoryitems:",
-        e?.message || e
-      );
+      await mongoose.connect(process.env.MONGO_URI);
+      console.log("✅ MongoDB connected");
+      return;
+    } catch (err) {
+      console.error(`❌ MongoDB connection failed (${i + 1}/${retries}):`, err.message);
+      if (i < retries - 1) await new Promise((r) => setTimeout(r, delay));
     }
-  })
-  .catch((err) => {
-    console.error("❌ MongoDB connection error:", err.message);
-    process.exit(1);
-  });
+  }
+  console.error("🚨 MongoDB could not connect after retries; continuing app for diagnostics.");
+}
 
-// Root + protected (unchanged)
+connectMongo();
+
+// Root
 app.get("/", (_req, res) =>
   res.json({ message: "Welcome to Chicken & Rice API 🍚🍗" })
 );
@@ -230,7 +189,7 @@ app.get("/api/protected", (req, res) => {
   });
 });
 
-// Routes (unchanged)
+// Routes
 app.use("/api/foods", foodRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/delivery", deliverymanRoutes);
@@ -241,16 +200,16 @@ app.use("/api/drinkpop", drinkPopRoutes);
 app.use("/api/proteinpop", proteinPopRoutes);
 app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
-// NEW
 app.use("/api/inventory", inventoryRoutes);
 
-// Error handler (unchanged)
+// Error handler
 app.use((err, _req, res, _next) => {
   console.error("⚠️ Server error:", err?.message || err);
   res.status(500).json({ error: "Something went wrong" });
 });
 
+// ✅ Ensure server keeps container alive
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
