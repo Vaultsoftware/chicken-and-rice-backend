@@ -11,45 +11,41 @@ import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 
 import { upload } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
-// ----------------------------------------------------------------------------
-// Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes
-// Fixes "/*", "/(.*)", "/(.*)?", "/(.*)+", "/(.*)*"
-// ----------------------------------------------------------------------------
+/* ----------------------------------------------------------------------------
+   Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes
+   Fixes "/*", "*", "/(.*)", "/(.*)?", "/(.*)+", "/(.*)*" anywhere routes get
+   registered (app, express.Router(), AND the underlying router package).
+---------------------------------------------------------------------------- */
 function compatifyPath(p) {
   if (typeof p !== "string") return p;
 
-  let changed = false;
   let reCount = 0;
   let wcCount = 0;
 
-  // Replace every '/(.*)' segment (with optional + * ? modifier) → '/:__v6_reN(.*)<mod>'
-  p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => {
-    changed = true;
-    return `/:__v6_re${reCount++}(.*)${mod}`;
-  });
+  // Replace every '/(.*)' (with optional + * ? modifier) → '/:__v6_reN(.*)<mod>'
+  p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:__v6_re${reCount++}(.*)${mod}`);
 
-  // Replace any '/*' segment(s) → '/:__v6_wcN(.*)'
-  p = p.replace(/\/\*(?=\/|$)/g, () => {
-    changed = true;
-    return `/:__v6_wc${wcCount++}(.*)`;
-  });
+  // Replace any segment '/*' → '/:__v6_wcN(.*)'
+  p = p.replace(/\/\*(?=\/|$)/g, () => `/:__v6_wc${wcCount++}(.*)`);
 
-  // Bare '*' or '/*'
+  // Bare '*' or '/*' only
   if (p === "*" || p === "/*") {
-    changed = true;
     p = "/:__v6_wc0(.*)";
   }
 
   return p;
 }
-function wrapMethods(target) {
-  const methods = ["get", "post", "put", "patch", "delete", "options", "head", "use", "all"];
+
+function wrapMethods(target, label = "target") {
+  if (!target) return;
+  const methods = ["get", "post", "put", "patch", "delete", "options", "head", "use", "all", "route"];
   for (const m of methods) {
-    const orig = target[m]?.bind(target);
+    const orig = target[m]?.bind?.(target);
     if (!orig) continue;
     target[m] = (first, ...rest) => {
       const patched = typeof first === "string" ? compatifyPath(first) : first;
@@ -58,17 +54,34 @@ function wrapMethods(target) {
   }
 }
 
+// create app first
 const app = express();
 app.set("trust proxy", 1);
 
-// Patch app + Router BEFORE loading route modules
-wrapMethods(app);
-const _Router = express.Router;
+// Patch app methods
+wrapMethods(app, "app");
+
+// Patch express.Router factory return values
+const _RouterFactory = express.Router;
 express.Router = function (...args) {
-  const r = _Router.apply(express, args);
-  wrapMethods(r);
+  const r = _RouterFactory.apply(express, args);
+  wrapMethods(r, "express.Router()");
   return r;
 };
+
+// Deep-patch the underlying "router" package that Express 5 uses internally,
+// so any routers created outside our control also get patched.
+try {
+  const require = createRequire(import.meta.url);
+  // "router" is CommonJS; default export is a function with a prototype
+  const RouterCtor = require("router");
+  if (RouterCtor?.prototype) {
+    wrapMethods(RouterCtor.prototype, "router.prototype");
+  }
+} catch (err) {
+  // If we can't reach it, keep going — app + express.Router are still patched.
+  console.warn("⚠️ router prototype patch skipped:", err?.message || err);
+}
 
 // ---- Firebase init ----
 try {
@@ -122,8 +135,7 @@ function sanitizeName(original = "file.bin") {
 }
 
 // -----------------------------------------------------------------------------
-// Firebase-backed uploads (Express 5-safe catch-all)
-// IMPORTANT: the param pattern must be (.*) — not (*)
+// Firebase-backed uploads (Express 5-safe catch-all) — use :param(.*)
 // -----------------------------------------------------------------------------
 app.get("/uploads/:path(.*)", async (req, res) => {
   try {
