@@ -4,80 +4,71 @@ import "dotenv/config";
 // ---- Timezone pin ----
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
-import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
 import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { createRequire } from "module";
 
 import { upload } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
-/* ----------------------------------------------------------------------------
-   Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes
-   Fixes "/*", "*", "/(.*)", "/(.*)?", "/(.*)+", "/(.*)*"
-   IMPORTANT: do NOT bind originals — preserve `this`.
----------------------------------------------------------------------------- */
+// -----------------------------------------------------------------------------
+// ONE-TIME low-level patch: fix legacy wildcards before router compiles paths.
+// We pre-load and replace `router/lib/layer` so any string path like
+// "/*" or "/(.*)" becomes "/:any(.*)" transparently.
+// No method binding, no `this` shenanigans.
+// -----------------------------------------------------------------------------
 function compatifyPath(p) {
   if (typeof p !== "string") return p;
 
   let reCount = 0;
   let wcCount = 0;
 
-  // Replace every '/(.*)' (with optional + * ? modifier) → '/:__v6_reN(.*)<mod>'
-  p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:__v6_re${reCount++}(.*)${mod}`);
+  // Replace '/(.*)', '/(.*)?', '/(.*)+', '/(.*)*'  →  '/:any(.*)<mod>'
+  p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:any${reCount++}(.*)${mod}`);
 
-  // Replace any segment '/*' → '/:__v6_wcN(.*)'
-  p = p.replace(/\/\*(?=\/|$)/g, () => `/:__v6_wc${wcCount++}(.*)`);
+  // Replace segment '/*' (at segment boundaries) → '/:any(.*)'
+  p = p.replace(/\/\*(?=\/|$)/g, () => `/:any${wcCount++}(.*)`);
 
   // Bare '*' or '/*'
-  if (p === "*" || p === "/*") p = "/:__v6_wc0(.*)";
+  if (p === "*" || p === "/*") p = "/:any0(.*)";
 
   return p;
 }
 
-function wrapMethods(target) {
-  if (!target) return;
-  const methods = ["get","post","put","patch","delete","options","head","use","all","route"];
-  for (const m of methods) {
-    const orig = target[m];
-    if (typeof orig !== "function") continue;
-    target[m] = function (first, ...rest) {
-      const patched = typeof first === "string" ? compatifyPath(first) : first;
-      // preserve `this`
-      return orig.call(this, patched, ...rest);
-    };
+const require = createRequire(import.meta.url);
+try {
+  const layerPath = require.resolve("router/lib/layer.js");
+  // Ensure module is loaded into cache, then swap its export
+  require(layerPath);
+  const cacheEntry = require.cache[layerPath];
+  const OrigLayer = cacheEntry.exports;
+
+  function PatchedLayer(pathArg, options, fn) {
+    if (!(this instanceof PatchedLayer)) return new PatchedLayer(pathArg, options, fn);
+    const safePath = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
+    return OrigLayer.call(this, safePath, options, fn);
   }
+  // Keep proto & static props intact
+  PatchedLayer.prototype = OrigLayer.prototype;
+  Object.defineProperties(PatchedLayer, Object.getOwnPropertyDescriptors(OrigLayer));
+  cacheEntry.exports = PatchedLayer;
+
+  console.log("🔧 Patched router Layer for legacy wildcard routes");
+} catch (err) {
+  console.warn("⚠️ Could not patch router Layer:", err?.message || err);
 }
 
-// create app first
+// Now import Express AFTER the patch so it picks up our Layer
+const { default: express } = await import("express");
+
+// -----------------------------------------------------------------------------
+
 const app = express();
 app.set("trust proxy", 1);
-
-// Patch app methods
-wrapMethods(app);
-
-// Patch express.Router factory return values
-const _RouterFactory = express.Router;
-express.Router = function (...args) {
-  const r = _RouterFactory.apply(express, args);
-  wrapMethods(r);
-  return r;
-};
-
-// Deep-patch the underlying "router" package Express 5 uses internally
-try {
-  const require = createRequire(import.meta.url);
-  const RouterCtor = require("router"); // CommonJS
-  if (RouterCtor?.prototype) {
-    wrapMethods(RouterCtor.prototype);
-  }
-} catch (err) {
-  console.warn("⚠️ router prototype patch skipped:", err?.message || err);
-}
 
 // ---- Firebase init ----
 try {
@@ -118,11 +109,11 @@ app.use(
   })
 );
 
-// ---- __dirname (retained) ----
+// ---- __dirname ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- Helper (local) ----
+// ---- Helper ----
 function sanitizeName(original = "file.bin") {
   const ext = path.extname(original).toLowerCase();
   const base = path.basename(original, ext);
@@ -131,7 +122,7 @@ function sanitizeName(original = "file.bin") {
 }
 
 // -----------------------------------------------------------------------------
-// Firebase-backed uploads (Express 5-safe catch-all) — use :param(.*)
+// Firebase-backed uploads (catch-all) — Express v5-safe using :param(.*)
 // -----------------------------------------------------------------------------
 app.get("/uploads/:path(.*)", async (req, res) => {
   try {
@@ -224,7 +215,7 @@ mongoose
   .then(async () => {
     console.log("✅ MongoDB connected");
 
-    // inventory index housekeeping (retained)
+    // inventory index housekeeping
     try {
       const coll = mongoose.connection.db.collection("inventoryitems");
       const indexes = await coll.indexes();
@@ -264,7 +255,7 @@ mongoose
     process.exit(1);
   });
 
-// ---- Import routers AFTER shim so patterns are compat ----
+// ---- Import routers (wildcards get auto-fixed by the patch above) ----
 const { default: foodRoutes } = await import("./routes/foodRoutes.js");
 const { default: orderRoutes } = await import("./routes/orders.js");
 const { default: deliverymanRoutes } = await import("./routes/deliverymanRoutes.js");
@@ -278,7 +269,8 @@ const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
 
 // ---- Root + protected ----
-app.get("/", (_req, res) => res.json({ message: "Welcome to Chicken & Rice API 🍚🍗" }));
+const appName = "Chicken & Rice API 🍚🍗";
+app.get("/", (_req, res) => res.json({ message: `Welcome to ${appName}` }));
 
 app.get("/api/protected", (req, res) => {
   const token = req.headers["authorization"]?.split(" ")[1];
