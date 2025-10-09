@@ -18,8 +18,8 @@ import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmi
 
 /* ----------------------------------------------------------------------------
    Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes
-   Fixes "/*", "*", "/(.*)", "/(.*)?", "/(.*)+", "/(.*)*" anywhere routes get
-   registered (app, express.Router(), AND the underlying router package).
+   Fixes "/*", "*", "/(.*)", "/(.*)?", "/(.*)+", "/(.*)*"
+   IMPORTANT: do NOT bind originals — preserve `this`.
 ---------------------------------------------------------------------------- */
 function compatifyPath(p) {
   if (typeof p !== "string") return p;
@@ -33,23 +33,22 @@ function compatifyPath(p) {
   // Replace any segment '/*' → '/:__v6_wcN(.*)'
   p = p.replace(/\/\*(?=\/|$)/g, () => `/:__v6_wc${wcCount++}(.*)`);
 
-  // Bare '*' or '/*' only
-  if (p === "*" || p === "/*") {
-    p = "/:__v6_wc0(.*)";
-  }
+  // Bare '*' or '/*'
+  if (p === "*" || p === "/*") p = "/:__v6_wc0(.*)";
 
   return p;
 }
 
-function wrapMethods(target, label = "target") {
+function wrapMethods(target) {
   if (!target) return;
-  const methods = ["get", "post", "put", "patch", "delete", "options", "head", "use", "all", "route"];
+  const methods = ["get","post","put","patch","delete","options","head","use","all","route"];
   for (const m of methods) {
-    const orig = target[m]?.bind?.(target);
-    if (!orig) continue;
-    target[m] = (first, ...rest) => {
+    const orig = target[m];
+    if (typeof orig !== "function") continue;
+    target[m] = function (first, ...rest) {
       const patched = typeof first === "string" ? compatifyPath(first) : first;
-      return orig(patched, ...rest);
+      // preserve `this`
+      return orig.call(this, patched, ...rest);
     };
   }
 }
@@ -59,27 +58,24 @@ const app = express();
 app.set("trust proxy", 1);
 
 // Patch app methods
-wrapMethods(app, "app");
+wrapMethods(app);
 
 // Patch express.Router factory return values
 const _RouterFactory = express.Router;
 express.Router = function (...args) {
   const r = _RouterFactory.apply(express, args);
-  wrapMethods(r, "express.Router()");
+  wrapMethods(r);
   return r;
 };
 
-// Deep-patch the underlying "router" package that Express 5 uses internally,
-// so any routers created outside our control also get patched.
+// Deep-patch the underlying "router" package Express 5 uses internally
 try {
   const require = createRequire(import.meta.url);
-  // "router" is CommonJS; default export is a function with a prototype
-  const RouterCtor = require("router");
+  const RouterCtor = require("router"); // CommonJS
   if (RouterCtor?.prototype) {
-    wrapMethods(RouterCtor.prototype, "router.prototype");
+    wrapMethods(RouterCtor.prototype);
   }
 } catch (err) {
-  // If we can't reach it, keep going — app + express.Router are still patched.
   console.warn("⚠️ router prototype patch skipped:", err?.message || err);
 }
 
