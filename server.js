@@ -15,25 +15,44 @@ import { fileURLToPath } from "url";
 import { upload, sanitizeName } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
-// ----------------------------------------------------------------------------
-// Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes.
-// Fixes patterns like "/*" and "/(.*)" that crash with "Unexpected ( ... ".
-// IMPORTANT: We will dynamically import routers *after* installing this shim.
-// ----------------------------------------------------------------------------
+/* ----------------------------------------------------------------------------
+   Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes.
+   Fixes patterns like "/*", "/(.*)", "/(.*)?", "/(.*)+", "/(.*)*".
+   We also dynamically import routers after installing the shim so it applies.
+---------------------------------------------------------------------------- */
 function compatifyPath(p) {
   if (typeof p !== "string") return p;
 
-  // convert any '/(.*)' segment(s) → '/:__v6_reN(.*)'
+  let changed = false;
   let reCount = 0;
-  p = p.replace(/\/\(\.\*\)(?=\/|$)/g, () => `/:__v6_re${reCount++}(.*)`);
-
-  // convert any '/*' segment(s) → '/:__v6_wcN(*)'
   let wcCount = 0;
-  p = p.replace(/\/\*(?=\/|$)/g, () => `/:__v6_wc${wcCount++}(*)`);
 
-  // bare '*' or '/*' as whole path
-  if (p === "*" || p === "/*") p = "/:__v6_wc0(*)";
+  // 1) Convert ALL '/(.*)' segments, including modifiers (? + *) => '/:__v6_reN(.*)<mod>'
+  //    Examples:
+  //      '/(.*)'    -> '/:__v6_re0(.*)'
+  //      '/(.*)?'   -> '/:__v6_re1(.*)?'
+  //      '/foo/(.*)/bar' -> '/foo/:__v6_re2(.*)/bar'
+  p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => {
+    changed = true;
+    return `/:__v6_re${reCount++}(.*)${mod}`;
+  });
 
+  // 2) Convert any '/*' segment(s) → '/:__v6_wcN(*)'
+  p = p.replace(/\/\*(?=\/|$)/g, () => {
+    changed = true;
+    return `/:__v6_wc${wcCount++}(*)`;
+  });
+
+  // 3) Bare '*' or '/*' as the whole path
+  if (p === "*" || p === "/*") {
+    changed = true;
+    p = "/:__v6_wc0(*)";
+  }
+
+  if (changed && process.env.DEBUG_WILDCARD === "1") {
+    // Optional debug
+    console.log("[compat route] →", p);
+  }
   return p;
 }
 
@@ -52,17 +71,15 @@ function wrapMethods(target) {
 const app = express();
 app.set("trust proxy", 1);
 
-// Patch the app instance
+// Patch app + Router BEFORE loading route modules
 wrapMethods(app);
-
-// Patch Router factory BEFORE route modules are loaded
 const _Router = express.Router;
 express.Router = function (...args) {
   const r = _Router.apply(express, args);
   wrapMethods(r);
   return r;
 };
-// ----------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------- */
 
 // Init Firebase (fail fast if creds missing)
 try {
