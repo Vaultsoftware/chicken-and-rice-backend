@@ -15,54 +15,56 @@ import { fileURLToPath } from "url";
 import { upload, sanitizeName } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
-// ---- App & Express v6 wildcard-compat shim (fix legacy `/*` routes) ----
-const app = express();
-app.set("trust proxy", 1);
-
-function v6CompatPath(p) {
+// ----------------------------------------------------------------------------
+// Express v5 / path-to-regexp v6 compatibility shim for legacy wildcard routes.
+// Fixes patterns like "/*" and "/(.*)" that crash with "Unexpected ( ... ".
+// IMPORTANT: We will dynamically import routers *after* installing this shim.
+// ----------------------------------------------------------------------------
+function compatifyPath(p) {
   if (typeof p !== "string") return p;
-  // bare "*" or "/*" → named wildcard
-  if (p === "*" || p === "/*") return "/:__v6_wild(*)";
-  // any "/something/*" segment(s) → "/something/:__v6_wild(*)"
-  return p.replace(/\/\*(?=\/|$)/g, "/:__v6_wild(*)");
+
+  // convert any '/(.*)' segment(s) → '/:__v6_reN(.*)'
+  let reCount = 0;
+  p = p.replace(/\/\(\.\*\)(?=\/|$)/g, () => `/:__v6_re${reCount++}(.*)`);
+
+  // convert any '/*' segment(s) → '/:__v6_wcN(*)'
+  let wcCount = 0;
+  p = p.replace(/\/\*(?=\/|$)/g, () => `/:__v6_wc${wcCount++}(*)`);
+
+  // bare '*' or '/*' as whole path
+  if (p === "*" || p === "/*") p = "/:__v6_wc0(*)";
+
+  return p;
 }
+
 function wrapMethods(target) {
-  const methods = ["get","post","put","patch","delete","options","head","use","all"];
+  const methods = ["get", "post", "put", "patch", "delete", "options", "head", "use", "all"];
   for (const m of methods) {
     const orig = target[m]?.bind(target);
     if (!orig) continue;
     target[m] = (first, ...rest) => {
-      const patched = typeof first === "string" ? v6CompatPath(first) : first;
+      const patched = typeof first === "string" ? compatifyPath(first) : first;
       return orig(patched, ...rest);
     };
   }
 }
+
+const app = express();
+app.set("trust proxy", 1);
+
+// Patch the app instance
 wrapMethods(app);
 
-// patch Router() factory so every router gets the shim too
+// Patch Router factory BEFORE route modules are loaded
 const _Router = express.Router;
 express.Router = function (...args) {
   const r = _Router.apply(express, args);
   wrapMethods(r);
   return r;
 };
-// -----------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
-// Routes (imports after shim so they inherit patched Router)
-import foodRoutes from "./routes/foodRoutes.js";
-import orderRoutes from "./routes/orders.js";
-import deliverymanRoutes from "./routes/deliverymanRoutes.js";
-import checkMealRoutes from "./routes/checkMeal.js";
-import adminAuthRoutes from "./routes/auth.js";
-import foodPopRoutes from "./routes/foodPopRoutes.js";
-import drinkPopRoutes from "./routes/drinkPopRoutes.js";
-import proteinPopRoutes from "./routes/proteinPopRoutes.js";
-import emailRoutes from "./routes/emailRoutes.js";
-import drinkRoutes from "./routes/drinkRoutes.js";
-// NEW
-import inventoryRoutes from "./routes/inventory.js";
-
-// Firebase once
+// Init Firebase (fail fast if creds missing)
 try {
   initFirebase();
   console.log("✅ Firebase initialized");
@@ -216,7 +218,7 @@ mongoose
         if (idx.name === "_id_") continue;
         if (isSlugSingleField(idx) && idx.unique) continue;
 
-      const keys = idx.key ? Object.keys(idx.key) : [];
+        const keys = idx.key ? Object.keys(idx.key) : [];
         const referencesSkuOrName = keys.some((k) => /^(sku|name)/i.test(k));
         const nonUniqueSlugSingle = isSlugSingleField(idx) && !idx.unique;
 
@@ -248,6 +250,20 @@ mongoose
     process.exit(1);
   });
 
+// ---------- Dynamically import routers AFTER shim so patterns are compat ----------
+const { default: foodRoutes } = await import("./routes/foodRoutes.js");
+const { default: orderRoutes } = await import("./routes/orders.js");
+const { default: deliverymanRoutes } = await import("./routes/deliverymanRoutes.js");
+const { default: checkMealRoutes } = await import("./routes/checkMeal.js");
+const { default: adminAuthRoutes } = await import("./routes/auth.js");
+const { default: foodPopRoutes } = await import("./routes/foodPopRoutes.js");
+const { default: drinkPopRoutes } = await import("./routes/drinkPopRoutes.js");
+const { default: proteinPopRoutes } = await import("./routes/proteinPopRoutes.js");
+const { default: emailRoutes } = await import("./routes/emailRoutes.js");
+const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
+const { default: inventoryRoutes } = await import("./routes/inventory.js");
+// -------------------------------------------------------------------------------
+
 // Root + protected
 app.get("/", (_req, res) =>
   res.json({ message: "Welcome to Chicken & Rice API 🍚🍗" })
@@ -273,7 +289,6 @@ app.use("/api/drinkpop", drinkPopRoutes);
 app.use("/api/proteinpop", proteinPopRoutes);
 app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
-// NEW
 app.use("/api/inventory", inventoryRoutes);
 
 // Error handler
