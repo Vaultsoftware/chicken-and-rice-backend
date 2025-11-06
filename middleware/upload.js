@@ -1,4 +1,7 @@
+// ============================================================================
 // backend/middleware/upload.js
+// Add SVG; keep memoryStorage; size limits preserved
+// ============================================================================
 import multer from "multer";
 
 const storage = multer.memoryStorage();
@@ -9,6 +12,7 @@ const ALLOWED = new Set([
   "image/webp",
   "image/gif",
   "image/avif",
+  "image/svg+xml",  // added
   "application/pdf",
 ]);
 

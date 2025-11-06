@@ -26,9 +26,10 @@ const app = express();
 app.set("trust proxy", 1);
 
 // ---- Firebase ----
+// ---- Firebase ----
 try {
-  initFirebase();
-  console.log("✅ Firebase initialized");
+  await initFirebase(); // ← wait for bucket check to complete
+  console.log(`✅ Firebase ready`);
 } catch (e) {
   console.error("❌ Firebase init failed:", e?.message || e);
   process.exit(1);

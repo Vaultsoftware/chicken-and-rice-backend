@@ -1,7 +1,11 @@
-// routes/drinkRoutes.js
+// ============================================================================
+// backend/routes/drinkRoutes.js
+// Writes image to Firebase Storage; stores path "/uploads/drinks/<key>"
+// ============================================================================
 import express from "express";
 import Drink from "../models/Drink.js";
 import { upload } from "../middleware/upload.js";
+import { saveToStorage, toNum } from "../lib/media.js";
 
 const router = express.Router();
 
@@ -9,15 +13,23 @@ const router = express.Router();
 router.post("/", upload.single("imageFile"), async (req, res) => {
   try {
     const { name, price } = req.body;
-    const drink = new Drink({
-      name,
-      price,
-      image: req.file ? `/uploads/${req.file.filename}` : undefined,
-    });
-    await drink.save();
+    if (!name || price == null) return res.status(400).json({ error: "name and price are required" });
+
+    let imagePath = undefined;
+    if (req.file?.buffer) {
+      const saved = await saveToStorage({
+        buffer: req.file.buffer,
+        originalname: req.file.originalname || "image.bin",
+        mimetype: req.file.mimetype,
+        prefix: "drinks",
+      });
+      imagePath = saved.path;
+    }
+
+    const drink = await Drink.create({ name, price: toNum(price, 0), image: imagePath });
     res.status(201).json(drink);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message || "Failed to create drink" });
   }
 });
 
@@ -27,7 +39,7 @@ router.get("/", async (_req, res) => {
     const drinks = await Drink.find().sort({ createdAt: -1 });
     res.json(drinks);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || "Failed to fetch drinks" });
   }
 });
 
@@ -38,7 +50,7 @@ router.get("/:id", async (req, res) => {
     if (!drink) return res.status(404).json({ error: "Drink not found" });
     res.json(drink);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || "Failed to fetch drink" });
   }
 });
 
@@ -46,9 +58,18 @@ router.get("/:id", async (req, res) => {
 router.put("/:id", upload.single("imageFile"), async (req, res) => {
   try {
     const { name, price } = req.body;
-    const updates = { name, price };
-    if (req.file) {
-      updates.image = `/uploads/${req.file.filename}`;
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (price !== undefined) updates.price = toNum(price);
+
+    if (req.file?.buffer) {
+      const saved = await saveToStorage({
+        buffer: req.file.buffer,
+        originalname: req.file.originalname || "image.bin",
+        mimetype: req.file.mimetype,
+        prefix: "drinks",
+      });
+      updates.image = saved.path;
     }
 
     const drink = await Drink.findByIdAndUpdate(req.params.id, updates, { new: true });
@@ -56,7 +77,7 @@ router.put("/:id", upload.single("imageFile"), async (req, res) => {
 
     res.json(drink);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message || "Failed to update drink" });
   }
 });
 
@@ -67,7 +88,7 @@ router.delete("/:id", async (req, res) => {
     if (!drink) return res.status(404).json({ error: "Drink not found" });
     res.json({ message: "Drink deleted" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || "Failed to delete drink" });
   }
 });
 
