@@ -1,35 +1,36 @@
-// ============================================================================
-// backend/routes/drinkRoutes.js
-// Writes image to Firebase Storage; stores path "/uploads/drinks/<key>"
-// ============================================================================
+// routes/drinkRoutes.js
 import express from "express";
 import Drink from "../models/Drink.js";
 import { upload } from "../middleware/upload.js";
-import { saveToStorage, toNum } from "../lib/media.js";
+import { putFile } from "../lib/firebaseAdmin.js";
 
 const router = express.Router();
+
+const sanitize = (name = "file.bin") => {
+  const dot = name.lastIndexOf(".");
+  const base = (dot === -1 ? name : name.slice(0, dot)).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "file";
+  const ext  = dot === -1 ? ".bin" : name.slice(dot).toLowerCase();
+  return `${Date.now()}-${base}${ext}`;
+};
+const makeKey = (prefix, originalname) => `${prefix}/${sanitize(originalname || "file.bin")}`;
 
 // Create drink
 router.post("/", upload.single("imageFile"), async (req, res) => {
   try {
     const { name, price } = req.body;
-    if (!name || price == null) return res.status(400).json({ error: "name and price are required" });
-
-    let imagePath = undefined;
+    let imagePath;
     if (req.file?.buffer) {
-      const saved = await saveToStorage({
-        buffer: req.file.buffer,
-        originalname: req.file.originalname || "image.bin",
-        mimetype: req.file.mimetype,
-        prefix: "drinks",
-      });
-      imagePath = saved.path;
+      const key = makeKey("drinks", req.file.originalname);
+      await putFile({ filename: key, buffer: req.file.buffer, contentType: req.file.mimetype });
+      imagePath = `/uploads/${key}`;
     }
 
-    const drink = await Drink.create({ name, price: toNum(price, 0), image: imagePath });
+    const drink = new Drink({ name, price, image: imagePath });
+    await drink.save();
     res.status(201).json(drink);
   } catch (err) {
-    res.status(400).json({ error: err.message || "Failed to create drink" });
+    console.error("❌ POST /drinks failed:", err?.message || err);
+    res.status(400).json({ error: err.message || "Failed to save drink" });
   }
 });
 
@@ -58,18 +59,12 @@ router.get("/:id", async (req, res) => {
 router.put("/:id", upload.single("imageFile"), async (req, res) => {
   try {
     const { name, price } = req.body;
-    const updates = {};
-    if (name !== undefined) updates.name = name;
-    if (price !== undefined) updates.price = toNum(price);
+    const updates = { name, price };
 
     if (req.file?.buffer) {
-      const saved = await saveToStorage({
-        buffer: req.file.buffer,
-        originalname: req.file.originalname || "image.bin",
-        mimetype: req.file.mimetype,
-        prefix: "drinks",
-      });
-      updates.image = saved.path;
+      const key = makeKey("drinks", req.file.originalname);
+      await putFile({ filename: key, buffer: req.file.buffer, contentType: req.file.mimetype });
+      updates.image = `/uploads/${key}`;
     }
 
     const drink = await Drink.findByIdAndUpdate(req.params.id, updates, { new: true });
@@ -77,6 +72,7 @@ router.put("/:id", upload.single("imageFile"), async (req, res) => {
 
     res.json(drink);
   } catch (err) {
+    console.error("❌ PUT /drinks/:id failed:", err?.message || err);
     res.status(400).json({ error: err.message || "Failed to update drink" });
   }
 });
