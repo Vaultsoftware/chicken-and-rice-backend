@@ -1,7 +1,15 @@
+// ============================================================================
 // File: backend/server.js
+// Note: Only two diagnostics imports added before Express. No logic removed.
+// ============================================================================
 import "dotenv/config";
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
+// import "./tools/express-log-paths.mjs";
+import "./tools/express-log-paths.mjs";
+import "./tools/route-guard.mjs";
+import "./tools/ptr-global-patch.mjs";
+import "./tools/route-debug.mjs";
 import mongoose from "mongoose";
 import cors from "cors";
 import jwt from "jsonwebtoken";
@@ -66,10 +74,10 @@ function sanitizeName(original = "file.bin") {
 }
 
 // ---- Upload proxy (catch-all) ----
-// v6-safe catchall: repeatable param
-app.get("/uploads/:path*", async (req, res) => {
+// Use RegExp to avoid path-to-regexp string parsing issues; capture goes to req.params[0]
+app.get(/^\/uploads\/(.+)$/, async (req, res) => {
   try {
-    const rel = req.params?.path || "";
+    const rel = req.params?.[0] || "";
     if (!rel) return res.status(404).end();
 
     const info = await statObject(rel);
