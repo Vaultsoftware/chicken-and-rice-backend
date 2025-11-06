@@ -11,16 +11,32 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 
-// Import express FIRST so we can patch its public API (no internals)
+// Import express FIRST so we can patch its public API.
 const { default: express } = await import("express");
 
-// ---- Express v5 legacy-route compatibility (public-API monkey patch) ----
-// Why: path-to-regexp@6 rejects legacy patterns. We rewrite them right at
-// app/router registration time, avoiding dependence on private modules.
+/* --------------------------------------------------------------------------
+Express v5 legacy-route compatibility (public API patch, no internals).
+Covers:
+ - '/(.*)' (+ modifiers)       → '/:splatN(.*)<mod>'
+ - '/segment/*'                → '/segment/:splatN*'
+ - '*' / '/*'                  → '/:splat0(.*)'
+ - '(/seg)?'                   → '/:optN(seg)?'
+ - '/(a|b)'                    → '/:altN(a|b)'
+Also rewrites:
+ - All leading path args across signatures: app.METHOD('/a','/b',fn)
+ - Arrays of paths: ['/(.*)', '/x/*', '/(a|b)']
+ - app.route(path)
+Debug: set COMPAT_ROUTE_DEBUG=1
+--------------------------------------------------------------------------- */
 (function installExpressCompat() {
   const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
+
   const HTTP_METHODS = [
-    "all","get","post","put","patch","delete","options","head","copy","lock","mkcol","move","purge","propfind","proppatch","search","trace","unlock","report","mkactivity","checkout","merge","m-search","notify","subscribe","unsubscribe","link","unlink"
+    "all","get","post","put","patch","delete","options","head",
+    // uncommon but supported in Express/router internals:
+    "copy","lock","mkcol","move","purge","propfind","proppatch","search","trace",
+    "unlock","report","mkactivity","checkout","merge","m-search","notify",
+    "subscribe","unsubscribe","link","unlink"
   ];
 
   function compatifyPath(p) {
@@ -28,71 +44,106 @@ const { default: express } = await import("express");
     const original = p;
     let splat = 0, opt = 0, alt = 0;
 
-    // '/(.*)' (+ modifiers)
+    // '/(.*)' with optional modifiers
     p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splat++}(.*)${mod}`);
 
-    // '/api/*' segment star
+    // '/api/*' (segment star)
     p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splat++}*`);
 
-    // Bare '*' or '/*'
+    // bare '*' or '/*'
     if (p === "*" || p === "/*") p = "/:splat0(.*)";
 
-    // Optional literal segment '(/bar)?'
+    // optional literal segment '(/bar)?'
     p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${opt++}(${seg})?`);
 
-    // Alternation without param '/(a|b)'
+    // alternation '/(a|b)'
     p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alts) => `/:alt${alt++}(${alts})`);
 
     if (DEBUG && p !== original) console.log(`🔧 compat route: "${original}" → "${p}"`);
     return p;
   }
 
-  // Patch util: normalize (path, ...handlers) arrays where first arg can be:
-  // string | RegExp | function | array of the above
-  function rewriteFirstString(args) {
-    if (!args || args.length === 0) return args;
-    const [first, ...rest] = args;
+  // Rewrite any number of leading "path-like" args until the first handler.
+  // path-like = string | RegExp | Array<string|RegExp>
+  function rewriteLeadingPaths(args) {
+    if (!args || !args.length) return args;
 
-    // Array of paths?
-    if (Array.isArray(first)) {
-      const mapped = first.map(x => (typeof x === "string" ? compatifyPath(x) : x));
-      return [mapped, ...rest];
+    const out = [];
+    let i = 0;
+    // Collect & rewrite until first non-path-like (function/object/number/etc.)
+    while (i < args.length) {
+      const a = args[i];
+      const isFn = typeof a === "function";
+      const isPathLike =
+        typeof a === "string" ||
+        a instanceof RegExp ||
+        (Array.isArray(a) && a.every(x => typeof x === "string" || x instanceof RegExp));
+
+      if (!isPathLike || isFn) break;
+
+      if (typeof a === "string") out.push(compatifyPath(a));
+      else if (Array.isArray(a)) {
+        out.push(a.map(x => (typeof x === "string" ? compatifyPath(x) : x)));
+      } else {
+        // RegExp untouched
+        out.push(a);
+      }
+      i++;
     }
 
-    // Single string path
-    if (typeof first === "string") {
-      return [compatifyPath(first), ...rest];
-    }
-
-    // Not a string path; leave as is
-    return args;
+    // push the rest unmodified
+    for (; i < args.length; i++) out.push(args[i]);
+    return out;
   }
 
-  // Patch App & Router prototypes
-  const appProto = express.application;
-  const router = express.Router;
-  const routerProto = router && router.prototype;
+  // Patch a prototype with .use, all HTTP methods, and .route()
+  function patchProto(proto) {
+    if (!proto) return;
 
-  // Patch .use on both App and Router
-  for (const proto of [appProto, routerProto]) {
-    if (!proto) continue;
+    // .use
     const origUse = proto.use;
-    proto.use = function patchedUse(...args) {
-      return origUse.apply(this, rewriteFirstString(args));
-    };
+    if (typeof origUse === "function") {
+      proto.use = function patchedUse(...args) {
+        return origUse.apply(this, rewriteLeadingPaths(args));
+      };
+    }
 
-    // Patch HTTP methods
+    // HTTP verbs
     for (const m of HTTP_METHODS) {
-      if (typeof proto[m] === "function") {
-        const orig = proto[m];
+      const orig = proto[m];
+      if (typeof orig === "function") {
         proto[m] = function patchedMethod(...args) {
-          return orig.apply(this, rewriteFirstString(args));
+          return orig.apply(this, rewriteLeadingPaths(args));
         };
       }
     }
+
+    // .route(path)
+    const origRoute = proto.route;
+    if (typeof origRoute === "function") {
+      proto.route = function patchedRoute(pathArg, ...rest) {
+        const p = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
+        return origRoute.apply(this, [p, ...rest]);
+      };
+    }
   }
 
-  if (DEBUG) console.log("🔧 Installed Express public-API compat shim");
+  // Patch App and Router
+  patchProto(express.application);
+  const Router = express.Router;
+  if (Router && Router.prototype) patchProto(Router.prototype);
+
+  // Also wrap the Router factory to ensure any fresh Router gets patched (defensive).
+  const origFactory = express.Router;
+  if (typeof origFactory === "function") {
+    express.Router = function patchedFactory(...args) {
+      const r = origFactory.apply(this, args);
+      patchProto(r); // instances are functions; patch its call signatures too
+      return r;
+    };
+  }
+
+  if (DEBUG) console.log("🔧 Installed Express public-API compat shim (multi-path & .route supported)");
 })();
 
 // ---- Local imports AFTER express shim ----
