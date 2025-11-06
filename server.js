@@ -1,95 +1,9 @@
 // File: backend/server.js
-// Single-file, production-ready with Express v5 path-to-regexp v6 compatibility.
-
 import "dotenv/config";
 
 // ---- Timezone pin ----
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
-// -----------------------------------------------------------------------------
-// Express v5 / path-to-regexp v6 legacy route compatibility (inline, no deps)
-// Rewrites legacy patterns so your existing routes won’t crash the router.
-// Toggle debug with COMPAT_ROUTE_DEBUG=1, disable with COMPAT_ROUTE_OFF=1.
-// -----------------------------------------------------------------------------
-import { createRequire } from "module";
-const __require = createRequire(import.meta.url);
-
-(function installCompatPatch() {
-  const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
-  const DISABLE = process.env.COMPAT_ROUTE_OFF === "1";
-  if (DISABLE) {
-    if (DEBUG) console.log("🔧 compat patch disabled via COMPAT_ROUTE_OFF=1");
-    return;
-  }
-
-  function compatifyPath(p) {
-    if (typeof p !== "string") return p;
-
-    let splatIdx = 0, optIdx = 0, altIdx = 0;
-    const original = p;
-
-    // '/(.*)' with optional modifiers  -> '/:splatN(.*)<mod>'
-    p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splatIdx++}(.*)${mod}`);
-
-    // '/api/*' (segment star) -> '/api/:splatN*'
-    p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splatIdx++}*`);
-
-    // Bare '*' or '/*'
-    if (p === "*" || p === "/*") p = "/:splat0(.*)";
-
-    // Optional literal segment '(/bar)?' -> '/:optN(bar)?'
-    p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${optIdx++}(${seg})?`);
-
-    // Alternation without param '/(a|b)' -> '/:altN(a|b)'
-    p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alt) => `/:alt${altIdx++}(${alt})`);
-
-    if (DEBUG && original !== p) {
-      // Critical visibility during rollout.
-      console.log(`🔧 compat route: "${original}"  →  "${p}"`);
-    }
-    return p;
-  }
-
-  let layerPath;
-  try {
-    layerPath = __require.resolve("router/lib/layer.js");
-  } catch {
-    try {
-      layerPath = __require.resolve("express/lib/router/layer.js");
-    } catch {
-      console.warn("⚠️ Could not locate router layer to patch.");
-      return;
-    }
-  }
-
-  // Load and replace export
-  __require(layerPath);
-  const cacheEntry = __require.cache[layerPath];
-  const OrigLayer = cacheEntry.exports;
-
-  function PatchedLayer(pathArg, options, fn) {
-    if (!(this instanceof PatchedLayer)) return new PatchedLayer(pathArg, options, fn);
-    const safePath = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
-
-    // Preserve constructor semantics across versions
-    const tmp = Object.create(OrigLayer.prototype);
-    const res = OrigLayer.apply(tmp, [safePath, options, fn]);
-    const inst = (res && typeof res === "object") ? res : tmp;
-    Object.setPrototypeOf(inst, PatchedLayer.prototype);
-    return inst;
-  }
-
-  // Preserve prototype and static props
-  PatchedLayer.prototype = OrigLayer.prototype;
-  Object.defineProperties(PatchedLayer, Object.getOwnPropertyDescriptors(OrigLayer));
-
-  cacheEntry.exports = PatchedLayer;
-  if (DEBUG) console.log("🔧 Installed router Layer compatibility patch");
-})();
-
-// -----------------------------------------------------------------------------
-// Imports AFTER patch so Express picks it up
-// -----------------------------------------------------------------------------
 import mongoose from "mongoose";
 import cors from "cors";
 import jwt from "jsonwebtoken";
@@ -97,8 +11,91 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 
+// Import express FIRST so we can patch its public API (no internals)
 const { default: express } = await import("express");
 
+// ---- Express v5 legacy-route compatibility (public-API monkey patch) ----
+// Why: path-to-regexp@6 rejects legacy patterns. We rewrite them right at
+// app/router registration time, avoiding dependence on private modules.
+(function installExpressCompat() {
+  const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
+  const HTTP_METHODS = [
+    "all","get","post","put","patch","delete","options","head","copy","lock","mkcol","move","purge","propfind","proppatch","search","trace","unlock","report","mkactivity","checkout","merge","m-search","notify","subscribe","unsubscribe","link","unlink"
+  ];
+
+  function compatifyPath(p) {
+    if (typeof p !== "string") return p;
+    const original = p;
+    let splat = 0, opt = 0, alt = 0;
+
+    // '/(.*)' (+ modifiers)
+    p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splat++}(.*)${mod}`);
+
+    // '/api/*' segment star
+    p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splat++}*`);
+
+    // Bare '*' or '/*'
+    if (p === "*" || p === "/*") p = "/:splat0(.*)";
+
+    // Optional literal segment '(/bar)?'
+    p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${opt++}(${seg})?`);
+
+    // Alternation without param '/(a|b)'
+    p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alts) => `/:alt${alt++}(${alts})`);
+
+    if (DEBUG && p !== original) console.log(`🔧 compat route: "${original}" → "${p}"`);
+    return p;
+  }
+
+  // Patch util: normalize (path, ...handlers) arrays where first arg can be:
+  // string | RegExp | function | array of the above
+  function rewriteFirstString(args) {
+    if (!args || args.length === 0) return args;
+    const [first, ...rest] = args;
+
+    // Array of paths?
+    if (Array.isArray(first)) {
+      const mapped = first.map(x => (typeof x === "string" ? compatifyPath(x) : x));
+      return [mapped, ...rest];
+    }
+
+    // Single string path
+    if (typeof first === "string") {
+      return [compatifyPath(first), ...rest];
+    }
+
+    // Not a string path; leave as is
+    return args;
+  }
+
+  // Patch App & Router prototypes
+  const appProto = express.application;
+  const router = express.Router;
+  const routerProto = router && router.prototype;
+
+  // Patch .use on both App and Router
+  for (const proto of [appProto, routerProto]) {
+    if (!proto) continue;
+    const origUse = proto.use;
+    proto.use = function patchedUse(...args) {
+      return origUse.apply(this, rewriteFirstString(args));
+    };
+
+    // Patch HTTP methods
+    for (const m of HTTP_METHODS) {
+      if (typeof proto[m] === "function") {
+        const orig = proto[m];
+        proto[m] = function patchedMethod(...args) {
+          return orig.apply(this, rewriteFirstString(args));
+        };
+      }
+    }
+  }
+
+  if (DEBUG) console.log("🔧 Installed Express public-API compat shim");
+})();
+
+// ---- Local imports AFTER express shim ----
 import { upload } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
@@ -291,7 +288,7 @@ mongoose
     process.exit(1);
   });
 
-// ---- Routers (legacy wildcards auto-fixed by compat patch) ----
+// ---- Routers (legacy wildcards auto-fixed by compat shim) ----
 const { default: foodRoutes } = await import("./routes/foodRoutes.js");
 const { default: orderRoutes } = await import("./routes/orders.js");
 const { default: deliverymanRoutes } = await import("./routes/deliverymanRoutes.js");
