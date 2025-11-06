@@ -8,162 +8,11 @@ import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { createRequire } from "module";
-
-const __require = createRequire(import.meta.url);
-
-// --- 0) Load express early (we’ll patch its public API) ---
-const { default: express } = await import("express");
-
-// -------------------- COMPAT SHIM (robust) --------------------
-(function installCompat() {
-  const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
-
-  function compatifyPath(p) {
-    if (typeof p !== "string") return p;
-    const original = p;
-    let splat = 0, opt = 0, alt = 0;
-
-    // 1) '/(.*)' (+ modifiers)
-    p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splat++}(.*)${mod}`);
-
-    // 2) '/x/*' → '/x/:splat*'
-    p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splat++}*`);
-
-    // 3) bare '*' or '/*'
-    if (p === "*" || p === "/*") p = "/:splat0(.*)";
-
-    // 4) '(/seg)?' → '/:opt(seg)?'
-    p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${opt++}(${seg})?`);
-
-    // 5) '/(a|b)' → '/:alt(a|b)'
-    p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alts) => `/:alt${alt++}(${alts})`);
-
-    // 6) Final guard for stray '(' or ')'
-    p = p.replace(/(\()|(\))/g, (m, lpar, rpar, idx) => {
-      if (lpar) {
-        const before = p.slice(Math.max(0, idx - 20), idx);
-        if (!/:\w*$/.test(before)) return "\\(";
-      }
-      if (rpar) {
-        const before = p.slice(0, idx);
-        const opened = (before.match(/:\w+\(/g) || []).length;
-        const closed = (before.match(/\)/g) || []).length;
-        if (opened <= closed) return "\\)";
-      }
-      return m;
-    });
-
-    if (DEBUG && p !== original) console.log(`🔧 compat route: "${original}" → "${p}"`);
-    return p;
-  }
-
-  function rewriteLeadingPaths(args) {
-    if (!args || !args.length) return args;
-    const out = [];
-    let i = 0;
-    while (i < args.length) {
-      const a = args[i];
-      const isFn = typeof a === "function";
-      const isPathLike =
-        typeof a === "string" ||
-        a instanceof RegExp ||
-        (Array.isArray(a) && a.every(x => typeof x === "string" || x instanceof RegExp));
-      if (!isPathLike || isFn) break;
-
-      if (typeof a === "string") out.push(compatifyPath(a));
-      else if (Array.isArray(a)) out.push(a.map(x => (typeof x === "string" ? compatifyPath(x) : x)));
-      else out.push(a); // RegExp untouched
-
-      i++;
-    }
-    for (; i < args.length; i++) out.push(args[i]);
-    return out;
-  }
-
-  const METHODS = [
-    "all","get","post","put","patch","delete","options","head",
-    "copy","lock","mkcol","move","purge","propfind","proppatch","search","trace",
-    "unlock","report","mkactivity","checkout","merge","m-search","notify",
-    "subscribe","unsubscribe","link","unlink"
-  ];
-
-  function patchProto(proto) {
-    if (!proto) return;
-    if (typeof proto.use === "function") {
-      const origUse = proto.use;
-      proto.use = function patchedUse(...args) {
-        return origUse.apply(this, rewriteLeadingPaths(args));
-      };
-    }
-    for (const m of METHODS) {
-      if (typeof proto[m] === "function") {
-        const orig = proto[m];
-        proto[m] = function patchedMethod(...args) {
-          return orig.apply(this, rewriteLeadingPaths(args));
-        };
-      }
-    }
-    if (typeof proto.route === "function") {
-      const origRoute = proto.route;
-      proto.route = function patchedRoute(pathArg, ...rest) {
-        const p = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
-        return origRoute.apply(this, [p, ...rest]);
-      };
-    }
-  }
-
-  patchProto(express.application);
-  const OrigRouterFactory = express.Router;
-  if (OrigRouterFactory && OrigRouterFactory.prototype) patchProto(OrigRouterFactory.prototype);
-  if (typeof OrigRouterFactory === "function") {
-    express.Router = function patchedRouter(...args) {
-      const r = OrigRouterFactory.apply(this, args);
-      patchProto(r);
-      return r;
-    };
-  }
-
-  // Wrap router Layer for extra logging
-  let layerPath;
-  try { layerPath = __require.resolve("router/lib/layer.js"); }
-  catch { try { layerPath = __require.resolve("express/lib/router/layer.js"); } catch { layerPath = null; } }
-
-  if (layerPath) {
-    __require(layerPath);
-    const cache = __require.cache[layerPath];
-    const OrigLayer = cache.exports;
-
-    function PatchedLayer(pathArg, options, fn) {
-      const raw = pathArg;
-      const safe = typeof raw === "string" ? compatifyPath(raw) : raw;
-      try {
-        return new OrigLayer(safe, options, fn);
-      } catch (e) {
-        console.error("⛔ Router Layer compile failed");
-        console.error("   raw:  ", raw);
-        console.error("   safe: ", safe);
-        throw e;
-      }
-    }
-    PatchedLayer.prototype = OrigLayer.prototype;
-    Object.setPrototypeOf(PatchedLayer, OrigLayer);
-    Object.defineProperties(PatchedLayer, Object.getOwnPropertyDescriptors(OrigLayer));
-
-    cache.exports = function LayerProxy(pathArg, options, fn) {
-      return PatchedLayer.call(this, pathArg, options, fn);
-    };
-    cache.exports.prototype = PatchedLayer.prototype;
-
-    if (DEBUG) console.log("🔧 Installed router Layer safety wrapper");
-  } else if (DEBUG) {
-    console.log("ℹ️ Layer module not found; API patch only");
-  }
-})();
-// ------------------ END COMPAT SHIM ------------------
 
 import { upload } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
+
+const { default: express } = await import("express");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -217,7 +66,7 @@ function sanitizeName(original = "file.bin") {
 }
 
 // ---- Upload proxy (catch-all) ----
-// IMPORTANT FIX: ':path(.*)' → ':path*' to avoid path-to-regexp crash
+// v6-safe catchall: repeatable param
 app.get("/uploads/:path*", async (req, res) => {
   try {
     const rel = req.params?.path || "";
@@ -323,6 +172,7 @@ const { default: proteinPopRoutes } = await import("./routes/proteinPopRoutes.js
 const { default: emailRoutes } = await import("./routes/emailRoutes.js");
 const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
+const { default: uploadRoutes } = await import("./routes/uploadRoutes.js");
 
 // Root + protected
 const appName = "Chicken & Rice API 🍚🍗";
@@ -349,6 +199,7 @@ app.use("/api/proteinpop", proteinPopRoutes);
 app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
 app.use("/api/inventory", inventoryRoutes);
+app.use("/api", uploadRoutes); // exposes POST /api/upload
 
 // Error handler
 app.use((err, _req, res, _next) => {
