@@ -2,18 +2,21 @@
 import "dotenv/config";
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
-import path from "path";
-import fs from "fs";
-import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import cors from "cors";
+import jwt from "jsonwebtoken";
+import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
 
 const __require = createRequire(import.meta.url);
 
-/* -------------------- CRITICAL: install compat BEFORE express -------------------- */
-(function installCompatEarly() {
+// --- 0) Load express early (we’ll patch its public API) ---
+const { default: express } = await import("express");
+
+// -------------------- COMPAT SHIM (robust) --------------------
+(function installCompat() {
   const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
 
   function compatifyPath(p) {
@@ -21,22 +24,32 @@ const __require = createRequire(import.meta.url);
     const original = p;
     let splat = 0, opt = 0, alt = 0;
 
-    p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splat++}(.*)${mod}`); // '/(.*)'
-    p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splat++}*`);                                // '/x/*'
-    if (p === "*" || p === "/*") p = "/:splat0(.*)";                                          // bare '*'
-    p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${opt++}(${seg})?`);               // '(/seg)?'
-    p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alts) => `/:alt${alt++}(${alts})`);         // '/(a|b)'
+    // 1) '/(.*)' (+ modifiers)
+    p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splat++}(.*)${mod}`);
 
-    // Escape stray '(' / ')'
-    p = p.replace(/(\()|(\))/g, (m, lp, rp, idx) => {
-      if (lp) {
-        const before = p.slice(Math.max(0, idx - 24), idx);
+    // 2) '/x/*' → '/x/:splat*'
+    p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splat++}*`);
+
+    // 3) bare '*' or '/*'
+    if (p === "*" || p === "/*") p = "/:splat0(.*)";
+
+    // 4) '(/seg)?' → '/:opt(seg)?'
+    p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${opt++}(${seg})?`);
+
+    // 5) '/(a|b)' → '/:alt(a|b)'
+    p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alts) => `/:alt${alt++}(${alts})`);
+
+    // 6) Final guard for stray '(' or ')'
+    p = p.replace(/(\()|(\))/g, (m, lpar, rpar, idx) => {
+      if (lpar) {
+        const before = p.slice(Math.max(0, idx - 20), idx);
         if (!/:\w*$/.test(before)) return "\\(";
-      } else if (rp) {
-        const left = p.slice(0, idx);
-        const openParams = (left.match(/:\w+\(/g) || []).length;
-        const closed = (left.match(/\)/g) || []).length;
-        if (openParams <= closed) return "\\)";
+      }
+      if (rpar) {
+        const before = p.slice(0, idx);
+        const opened = (before.match(/:\w+\(/g) || []).length;
+        const closed = (before.match(/\)/g) || []).length;
+        if (opened <= closed) return "\\)";
       }
       return m;
     });
@@ -45,35 +58,76 @@ const __require = createRequire(import.meta.url);
     return p;
   }
 
-  // 1) Patch path-to-regexp.match to log + sanitize
-  let p2rPath = null;
-  try {
-    p2rPath = __require.resolve("path-to-regexp/dist/index.js");
-    __require(p2rPath);
-    const cache = __require.cache[p2rPath];
-    const mod = cache.exports;
-    const origMatch = mod.match;
-    if (typeof origMatch === "function") {
-      mod.match = function patchedMatch(path, ...rest) {
-        try {
-          return origMatch.call(this, path, ...rest);
-        } catch (e) {
-          if (typeof path === "string") {
-            const safe = compatifyPath(path);
-            console.error("⛳ BAD PATH (p2r/raw):", path);
-            console.error("⛳ BAD PATH (p2r/safe):", safe);
-            return origMatch.call(this, safe, ...rest);
-          }
-          throw e;
-        }
+  function rewriteLeadingPaths(args) {
+    if (!args || !args.length) return args;
+    const out = [];
+    let i = 0;
+    while (i < args.length) {
+      const a = args[i];
+      const isFn = typeof a === "function";
+      const isPathLike =
+        typeof a === "string" ||
+        a instanceof RegExp ||
+        (Array.isArray(a) && a.every(x => typeof x === "string" || x instanceof RegExp));
+      if (!isPathLike || isFn) break;
+
+      if (typeof a === "string") out.push(compatifyPath(a));
+      else if (Array.isArray(a)) out.push(a.map(x => (typeof x === "string" ? compatifyPath(x) : x)));
+      else out.push(a); // RegExp untouched
+
+      i++;
+    }
+    for (; i < args.length; i++) out.push(args[i]);
+    return out;
+  }
+
+  const METHODS = [
+    "all","get","post","put","patch","delete","options","head",
+    "copy","lock","mkcol","move","purge","propfind","proppatch","search","trace",
+    "unlock","report","mkactivity","checkout","merge","m-search","notify",
+    "subscribe","unsubscribe","link","unlink"
+  ];
+
+  function patchProto(proto) {
+    if (!proto) return;
+    if (typeof proto.use === "function") {
+      const origUse = proto.use;
+      proto.use = function patchedUse(...args) {
+        return origUse.apply(this, rewriteLeadingPaths(args));
       };
     }
-  } catch { /* ignore */ }
+    for (const m of METHODS) {
+      if (typeof proto[m] === "function") {
+        const orig = proto[m];
+        proto[m] = function patchedMethod(...args) {
+          return orig.apply(this, rewriteLeadingPaths(args));
+        };
+      }
+    }
+    if (typeof proto.route === "function") {
+      const origRoute = proto.route;
+      proto.route = function patchedRoute(pathArg, ...rest) {
+        const p = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
+        return origRoute.apply(this, [p, ...rest]);
+      };
+    }
+  }
 
-  // 2) Patch router Layer constructor (constructable)
-  let layerPath = null;
+  patchProto(express.application);
+  const OrigRouterFactory = express.Router;
+  if (OrigRouterFactory && OrigRouterFactory.prototype) patchProto(OrigRouterFactory.prototype);
+  if (typeof OrigRouterFactory === "function") {
+    express.Router = function patchedRouter(...args) {
+      const r = OrigRouterFactory.apply(this, args);
+      patchProto(r);
+      return r;
+    };
+  }
+
+  // Wrap router Layer for extra logging
+  let layerPath;
   try { layerPath = __require.resolve("router/lib/layer.js"); }
-  catch { try { layerPath = __require.resolve("express/lib/router/layer.js"); } catch {} }
+  catch { try { layerPath = __require.resolve("express/lib/router/layer.js"); } catch { layerPath = null; } }
 
   if (layerPath) {
     __require(layerPath);
@@ -83,93 +137,38 @@ const __require = createRequire(import.meta.url);
     function PatchedLayer(pathArg, options, fn) {
       const raw = pathArg;
       const safe = typeof raw === "string" ? compatifyPath(raw) : raw;
-      if (typeof raw === "string" && raw.includes("(") && !/:([\w]+)\(/.test(raw)) {
-        console.error("⛳ BAD PATH (layer/raw):", raw);
-        console.error("⛳ BAD PATH (layer/safe):", safe);
+      try {
+        return new OrigLayer(safe, options, fn);
+      } catch (e) {
+        console.error("⛔ Router Layer compile failed");
+        console.error("   raw:  ", raw);
+        console.error("   safe: ", safe);
+        throw e;
       }
-      return OrigLayer.call(this, safe, options, fn); // preserve `new` usage
     }
     PatchedLayer.prototype = OrigLayer.prototype;
     Object.setPrototypeOf(PatchedLayer, OrigLayer);
     Object.defineProperties(PatchedLayer, Object.getOwnPropertyDescriptors(OrigLayer));
-    cache.exports = PatchedLayer;
-  }
 
-  // 3) After Layer+P2R are patched, load express and patch public API
-  const { default: expressLocal } = __require("express"); // CJS require to avoid ESM timing
-  const METHODS = [
-    "all","get","post","put","patch","delete","options","head",
-    "copy","lock","mkcol","move","purge","propfind","proppatch","search","trace",
-    "unlock","report","mkactivity","checkout","merge","m-search","notify",
-    "subscribe","unsubscribe","link","unlink"
-  ];
-
-  const looksBad = (s) => typeof s === "string" && s.includes("(") && !/:([\w]+)\(/.test(s);
-  function rewriteLeadingPaths(args) {
-    if (!args?.length) return args;
-    const out = [];
-    let i = 0;
-    while (i < args.length) {
-      const a = args[i];
-      const isFn = typeof a === "function";
-      const isPathLike = typeof a === "string" || a instanceof RegExp ||
-        (Array.isArray(a) && a.every(x => typeof x === "string" || x instanceof RegExp));
-      if (!isPathLike || isFn) break;
-
-      if (typeof a === "string") out.push(compatifyPath(a));
-      else if (Array.isArray(a)) out.push(a.map(x => (typeof x === "string" ? compatifyPath(x) : x)));
-      else out.push(a);
-      i++;
-    }
-    for (; i < args.length; i++) out.push(args[i]);
-    return out;
-  }
-
-  function patchProto(proto) {
-    if (!proto) return;
-    if (typeof proto.use === "function") {
-      const orig = proto.use;
-      proto.use = function (...args) { return orig.apply(this, rewriteLeadingPaths(args)); };
-    }
-    for (const m of METHODS) {
-      if (typeof proto[m] === "function") {
-        const orig = proto[m];
-        proto[m] = function (...args) { return orig.apply(this, rewriteLeadingPaths(args)); };
-      }
-    }
-    if (typeof proto.route === "function") {
-      const origRoute = proto.route;
-      proto.route = function (pathArg, ...rest) {
-        if (looksBad(pathArg)) console.error("⛳ BAD PATH (.route):", pathArg);
-        const p = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
-        return origRoute.apply(this, [p, ...rest]);
-      };
-    }
-  }
-
-  patchProto(expressLocal.application);
-  const RF = expressLocal.Router;
-  if (RF?.prototype) patchProto(RF.prototype);
-  if (typeof RF === "function") {
-    expressLocal.Router = function patchedRouter(...args) {
-      const r = RF.apply(this, args);
-      patchProto(r);
-      return r;
+    cache.exports = function LayerProxy(pathArg, options, fn) {
+      return PatchedLayer.call(this, pathArg, options, fn);
     };
+    cache.exports.prototype = PatchedLayer.prototype;
+
+    if (DEBUG) console.log("🔧 Installed router Layer safety wrapper");
+  } else if (DEBUG) {
+    console.log("ℹ️ Layer module not found; API patch only");
   }
 })();
-/* ------------------ END compat prelude ------------------ */
-
-// Now import express as ESM (after prelude patched CJS singleton)
-const { default: express } = await import("express");
+// ------------------ END COMPAT SHIM ------------------
 
 import { upload } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
-/* -------------------- APP -------------------- */
 const app = express();
 app.set("trust proxy", 1);
 
+// ---- Firebase ----
 try {
   initFirebase();
   console.log("✅ Firebase initialized");
@@ -178,9 +177,11 @@ try {
   process.exit(1);
 }
 
+// ---- Parsers ----
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
+// ---- CORS ----
 const allowedOrigins = [
   "https://chickenandrice.net",
   "https://www.chickenandrice.net",
@@ -203,9 +204,11 @@ app.use(
   })
 );
 
+// ---- __dirname ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ---- Helper ----
 function sanitizeName(original = "file.bin") {
   const ext = path.extname(original).toLowerCase();
   const base = path.basename(original, ext);
@@ -213,15 +216,20 @@ function sanitizeName(original = "file.bin") {
   return `${Date.now()}-${safe}${ext || ".bin"}`;
 }
 
-app.get("/uploads/:path(.*)", async (req, res) => {
+// ---- Upload proxy (catch-all) ----
+// IMPORTANT FIX: ':path(.*)' → ':path*' to avoid path-to-regexp crash
+app.get("/uploads/:path*", async (req, res) => {
   try {
     const rel = req.params?.path || "";
     if (!rel) return res.status(404).end();
+
     const info = await statObject(rel);
     if (!info) return res.status(404).json({ error: "Not found" });
+
     const { file, meta } = info;
     if (meta?.contentType) res.setHeader("Content-Type", meta.contentType);
     res.setHeader("Cache-Control", meta?.cacheControl || "public, max-age=31536000, immutable");
+
     const stream = file.createReadStream();
     stream.on("error", (err) => {
       console.error("⚠️ GCS stream error:", err?.message || err);
@@ -234,6 +242,7 @@ app.get("/uploads/:path(.*)", async (req, res) => {
   }
 });
 
+// ---- Health ----
 app.get("/healthz", (_req, res) => {
   const ok = Boolean(process.env.MONGO_URI) && Boolean(process.env.JWT_SECRET);
   const bucket = getBucket();
@@ -245,28 +254,31 @@ app.get("/__diag/ping", (_req, res) => {
   catch { res.json({ ok: false }); }
 });
 
-app.get("/__diag/routes", (_req, res) => {
-  const rows = [];
-  const collect = (stack, base = "") => {
-    for (const layer of stack || []) {
-      const route = layer.route;
-      if (route?.path) {
-        for (const m of Object.keys(route.methods || {})) rows.push({ method: m.toUpperCase(), path: base + route.path });
-      } else if (layer?.name === "router" && layer?.handle?.stack) {
-        collect(layer.handle.stack, base);
-      }
-    }
-  };
-  collect(app._router?.stack);
-  res.json({ count: rows.length, routes: rows });
+app.post("/__diag/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "no file" });
+    const filename = sanitizeName(req.file.originalname || "file.bin");
+    let buffer = req.file.buffer;
+    if (!buffer && req.file.path) buffer = fs.readFileSync(req.file.path);
+    await putFile({ filename, buffer, contentType: req.file.mimetype });
+    return res.json({ saved: true, filename, url: `/uploads/${filename}` });
+  } catch (e) {
+    console.error("⚠️ diag upload failed:", e?.message || e);
+    return res.status(500).json({ error: "upload failed" });
+  }
 });
 
-/* ---- Mongo ---- */
+app.get("/__diag/time", (_req, res) => {
+  const now = new Date();
+  const start = new Date(now); start.setHours(0,0,0,0);
+  res.json({ tz: process.env.TZ || "system-default", nowISO: now.toISOString(), startOfTodayISO: start.toISOString() });
+});
+
+// ---- Mongo ----
 if (!process.env.MONGO_URI) console.error("❌ MONGO_URI is not set");
 if (!process.env.JWT_SECRET) console.warn("⚠️ JWT_SECRET is not set");
 
-mongoose
-  .connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI)
   .then(async () => {
     console.log("✅ MongoDB connected");
     try {
@@ -299,7 +311,7 @@ mongoose
     process.exit(1);
   });
 
-/* ---- Routers ---- */
+// ---- Routers ----
 const { default: foodRoutes } = await import("./routes/foodRoutes.js");
 const { default: orderRoutes } = await import("./routes/orders.js");
 const { default: deliverymanRoutes } = await import("./routes/deliverymanRoutes.js");
@@ -312,7 +324,7 @@ const { default: emailRoutes } = await import("./routes/emailRoutes.js");
 const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
 
-/* ---- Root + protected ---- */
+// Root + protected
 const appName = "Chicken & Rice API 🍚🍗";
 app.get("/", (_req, res) => res.json({ message: `Welcome to ${appName}` }));
 
@@ -325,7 +337,7 @@ app.get("/api/protected", (req, res) => {
   });
 });
 
-/* ---- API ---- */
+// API routes
 app.use("/api/foods", foodRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/delivery", deliverymanRoutes);
@@ -338,7 +350,7 @@ app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
 app.use("/api/inventory", inventoryRoutes);
 
-/* ---- Errors ---- */
+// Error handler
 app.use((err, _req, res, _next) => {
   console.error("⚠️ Server error:", err?.message || err);
   res.status(500).json({ error: "Something went wrong" });
