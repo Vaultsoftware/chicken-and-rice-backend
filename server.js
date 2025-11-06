@@ -1,9 +1,11 @@
 // ============================================================================
-// File: backend/server.js (synced)
+// File: backend/server.js
+// Note: Only two diagnostics imports added before Express. No logic removed.
 // ============================================================================
 import "dotenv/config";
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
+// import "./tools/express-log-paths.mjs";
 import "./tools/express-log-paths.mjs";
 import "./tools/route-guard.mjs";
 import "./tools/ptr-global-patch.mjs";
@@ -23,10 +25,11 @@ const { default: express } = await import("express");
 const app = express();
 app.set("trust proxy", 1);
 
-// ---- Firebase (awaited) ----
+// ---- Firebase ----
+// ---- Firebase ----
 try {
-  await initFirebase();
-  console.log("✅ Firebase ready");
+  await initFirebase(); // ← wait for bucket check to complete
+  console.log(`✅ Firebase ready`);
 } catch (e) {
   console.error("❌ Firebase init failed:", e?.message || e);
   process.exit(1);
@@ -47,9 +50,9 @@ const allowedOrigins = [
 ];
 app.use(
   cors({
-    origin(origin, cb) {
+    origin: function (origin, cb) {
       if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin) || allowedOrigins.some((o) => o instanceof RegExp && o.test(origin))) {
+      if (allowedOrigins.includes(origin) || allowedOrigins.some(o => o instanceof RegExp && o.test(origin))) {
         return cb(null, true);
       }
       console.error("❌ Blocked by CORS:", origin);
@@ -63,25 +66,16 @@ app.use(
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- Helpers ----
+// ---- Helper ----
 function sanitizeName(original = "file.bin") {
-  const ext = path.extname(original).toLowerCase() || ".bin";
+  const ext = path.extname(original).toLowerCase();
   const base = path.basename(original, ext);
-  const safe = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "file";
-  return `${Date.now()}-${safe}${ext}`;
+  const safe = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  return `${Date.now()}-${safe}${ext || ".bin"}`;
 }
 
-// ---- Optional: storage readiness guard (fast-fail if something breaks later) ----
-app.use((req, res, next) => {
-  try {
-    getBucket();
-    return next();
-  } catch {
-    return res.status(503).json({ error: "storage not ready" });
-  }
-});
-
 // ---- Upload proxy (catch-all) ----
+// Use RegExp to avoid path-to-regexp string parsing issues; capture goes to req.params[0]
 app.get(/^\/uploads\/(.+)$/, async (req, res) => {
   try {
     const rel = req.params?.[0] || "";
@@ -109,9 +103,8 @@ app.get(/^\/uploads\/(.+)$/, async (req, res) => {
 // ---- Health ----
 app.get("/healthz", (_req, res) => {
   const ok = Boolean(process.env.MONGO_URI) && Boolean(process.env.JWT_SECRET);
-  let bucketName = null;
-  try { bucketName = getBucket()?.name || null; } catch {}
-  res.json({ ok, mongoUriConfigured: !!process.env.MONGO_URI, jwtConfigured: !!process.env.JWT_SECRET, bucket: bucketName });
+  const bucket = getBucket();
+  res.json({ ok, mongoUriConfigured: !!process.env.MONGO_URI, jwtConfigured: !!process.env.JWT_SECRET, bucket: bucket?.name || null });
 });
 
 app.get("/__diag/ping", (_req, res) => {
@@ -122,7 +115,7 @@ app.get("/__diag/ping", (_req, res) => {
 app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "no file" });
-    const filename = `diagnostics/${sanitizeName(req.file.originalname || "file.bin")}`;
+    const filename = sanitizeName(req.file.originalname || "file.bin");
     let buffer = req.file.buffer;
     if (!buffer && req.file.path) buffer = fs.readFileSync(req.file.path);
     await putFile({ filename, buffer, contentType: req.file.mimetype });
@@ -135,7 +128,7 @@ app.post("/__diag/upload", upload.single("file"), async (req, res) => {
 
 app.get("/__diag/time", (_req, res) => {
   const now = new Date();
-  const start = new Date(now); start.setHours(0, 0, 0, 0);
+  const start = new Date(now); start.setHours(0,0,0,0);
   res.json({ tz: process.env.TZ || "system-default", nowISO: now.toISOString(), startOfTodayISO: start.toISOString() });
 });
 
