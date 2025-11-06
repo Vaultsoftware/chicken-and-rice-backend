@@ -1,69 +1,106 @@
-// backend/server.js
+// File: backend/server.js
+// Single-file, production-ready with Express v5 path-to-regexp v6 compatibility.
+
 import "dotenv/config";
 
 // ---- Timezone pin ----
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
-import mongoose from "mongoose";
-import cors from "cors";
-import jwt from "jsonwebtoken";
-import path from "path";
-import fs from "fs";
-import { fileURLToPath, pathToFileURL } from "url";
+// -----------------------------------------------------------------------------
+// Express v5 / path-to-regexp v6 legacy route compatibility (inline, no deps)
+// Rewrites legacy patterns so your existing routes won’t crash the router.
+// Toggle debug with COMPAT_ROUTE_DEBUG=1, disable with COMPAT_ROUTE_OFF=1.
+// -----------------------------------------------------------------------------
 import { createRequire } from "module";
+const __require = createRequire(import.meta.url);
 
-import { upload } from "./middleware/upload.js";
-import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
+(function installCompatPatch() {
+  const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
+  const DISABLE = process.env.COMPAT_ROUTE_OFF === "1";
+  if (DISABLE) {
+    if (DEBUG) console.log("🔧 compat patch disabled via COMPAT_ROUTE_OFF=1");
+    return;
+  }
 
-// -----------------------------------------------------------------------------
-// ONE-TIME low-level patch: fix legacy wildcards before router compiles paths.
-// We pre-load and replace `router/lib/layer` so any string path like
-// "/*" or "/(.*)" becomes "/:any(.*)" transparently.
-// No method binding, no `this` shenanigans.
-// -----------------------------------------------------------------------------
-function compatifyPath(p) {
-  if (typeof p !== "string") return p;
+  function compatifyPath(p) {
+    if (typeof p !== "string") return p;
 
-  let reCount = 0;
-  let wcCount = 0;
+    let splatIdx = 0, optIdx = 0, altIdx = 0;
+    const original = p;
 
-  // Replace '/(.*)', '/(.*)?', '/(.*)+', '/(.*)*'  →  '/:any(.*)<mod>'
-  p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:any${reCount++}(.*)${mod}`);
+    // '/(.*)' with optional modifiers  -> '/:splatN(.*)<mod>'
+    p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splatIdx++}(.*)${mod}`);
 
-  // Replace segment '/*' (at segment boundaries) → '/:any(.*)'
-  p = p.replace(/\/\*(?=\/|$)/g, () => `/:any${wcCount++}(.*)`);
+    // '/api/*' (segment star) -> '/api/:splatN*'
+    p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splatIdx++}*`);
 
-  // Bare '*' or '/*'
-  if (p === "*" || p === "/*") p = "/:any0(.*)";
+    // Bare '*' or '/*'
+    if (p === "*" || p === "/*") p = "/:splat0(.*)";
 
-  return p;
-}
+    // Optional literal segment '(/bar)?' -> '/:optN(bar)?'
+    p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${optIdx++}(${seg})?`);
 
-const require = createRequire(import.meta.url);
-try {
-  const layerPath = require.resolve("router/lib/layer.js");
-  // Ensure module is loaded into cache, then swap its export
-  require(layerPath);
-  const cacheEntry = require.cache[layerPath];
+    // Alternation without param '/(a|b)' -> '/:altN(a|b)'
+    p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alt) => `/:alt${altIdx++}(${alt})`);
+
+    if (DEBUG && original !== p) {
+      // Critical visibility during rollout.
+      console.log(`🔧 compat route: "${original}"  →  "${p}"`);
+    }
+    return p;
+  }
+
+  let layerPath;
+  try {
+    layerPath = __require.resolve("router/lib/layer.js");
+  } catch {
+    try {
+      layerPath = __require.resolve("express/lib/router/layer.js");
+    } catch {
+      console.warn("⚠️ Could not locate router layer to patch.");
+      return;
+    }
+  }
+
+  // Load and replace export
+  __require(layerPath);
+  const cacheEntry = __require.cache[layerPath];
   const OrigLayer = cacheEntry.exports;
 
   function PatchedLayer(pathArg, options, fn) {
     if (!(this instanceof PatchedLayer)) return new PatchedLayer(pathArg, options, fn);
     const safePath = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
-    return OrigLayer.call(this, safePath, options, fn);
+
+    // Preserve constructor semantics across versions
+    const tmp = Object.create(OrigLayer.prototype);
+    const res = OrigLayer.apply(tmp, [safePath, options, fn]);
+    const inst = (res && typeof res === "object") ? res : tmp;
+    Object.setPrototypeOf(inst, PatchedLayer.prototype);
+    return inst;
   }
-  // Keep proto & static props intact
+
+  // Preserve prototype and static props
   PatchedLayer.prototype = OrigLayer.prototype;
   Object.defineProperties(PatchedLayer, Object.getOwnPropertyDescriptors(OrigLayer));
+
   cacheEntry.exports = PatchedLayer;
+  if (DEBUG) console.log("🔧 Installed router Layer compatibility patch");
+})();
 
-  console.log("🔧 Patched router Layer for legacy wildcard routes");
-} catch (err) {
-  console.warn("⚠️ Could not patch router Layer:", err?.message || err);
-}
+// -----------------------------------------------------------------------------
+// Imports AFTER patch so Express picks it up
+// -----------------------------------------------------------------------------
+import mongoose from "mongoose";
+import cors from "cors";
+import jwt from "jsonwebtoken";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
-// Now import Express AFTER the patch so it picks up our Layer
 const { default: express } = await import("express");
+
+import { upload } from "./middleware/upload.js";
+import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
 
 // -----------------------------------------------------------------------------
 
@@ -87,7 +124,7 @@ app.use(express.urlencoded({ extended: true }));
 const allowedOrigins = [
   "https://chickenandrice.net",
   "https://www.chickenandrice.net",
-  /\.chickenandrice\.net$/,
+  /\.chickenandrice\.net$/i,
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "https://chickenandrice.vercel.app",
@@ -174,7 +211,6 @@ app.post("/__diag/upload", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "no file" });
     const filename = sanitizeName(req.file.originalname || "file.bin");
 
-    // support memory or disk storage
     let buffer = req.file.buffer;
     if (!buffer && req.file.path) buffer = fs.readFileSync(req.file.path);
 
@@ -255,7 +291,7 @@ mongoose
     process.exit(1);
   });
 
-// ---- Import routers (wildcards get auto-fixed by the patch above) ----
+// ---- Routers (legacy wildcards auto-fixed by compat patch) ----
 const { default: foodRoutes } = await import("./routes/foodRoutes.js");
 const { default: orderRoutes } = await import("./routes/orders.js");
 const { default: deliverymanRoutes } = await import("./routes/deliverymanRoutes.js");
