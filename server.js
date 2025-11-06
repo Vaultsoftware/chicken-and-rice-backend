@@ -1,7 +1,5 @@
 // File: backend/server.js
 import "dotenv/config";
-
-// ---- Timezone pin ----
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
 import mongoose from "mongoose";
@@ -10,67 +8,66 @@ import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 
-// Import express FIRST so we can patch its public API.
+const __require = createRequire(import.meta.url);
+
+// --- 0) Load express early (we’ll patch its public API) ---
 const { default: express } = await import("express");
 
-/* --------------------------------------------------------------------------
-Express v5 legacy-route compatibility (public API patch, no internals).
-Covers:
- - '/(.*)' (+ modifiers)       → '/:splatN(.*)<mod>'
- - '/segment/*'                → '/segment/:splatN*'
- - '*' / '/*'                  → '/:splat0(.*)'
- - '(/seg)?'                   → '/:optN(seg)?'
- - '/(a|b)'                    → '/:altN(a|b)'
-Also rewrites:
- - All leading path args across signatures: app.METHOD('/a','/b',fn)
- - Arrays of paths: ['/(.*)', '/x/*', '/(a|b)']
- - app.route(path)
-Debug: set COMPAT_ROUTE_DEBUG=1
---------------------------------------------------------------------------- */
-(function installExpressCompat() {
+// -------------------- COMPAT SHIM (robust) --------------------
+(function installCompat() {
   const DEBUG = process.env.COMPAT_ROUTE_DEBUG === "1";
-
-  const HTTP_METHODS = [
-    "all","get","post","put","patch","delete","options","head",
-    // uncommon but supported in Express/router internals:
-    "copy","lock","mkcol","move","purge","propfind","proppatch","search","trace",
-    "unlock","report","mkactivity","checkout","merge","m-search","notify",
-    "subscribe","unsubscribe","link","unlink"
-  ];
 
   function compatifyPath(p) {
     if (typeof p !== "string") return p;
     const original = p;
     let splat = 0, opt = 0, alt = 0;
 
-    // '/(.*)' with optional modifiers
+    // 1) '/(.*)' (+ modifiers)
     p = p.replace(/\/\(\.\*\)([+*?])?/g, (_m, mod = "") => `/:splat${splat++}(.*)${mod}`);
 
-    // '/api/*' (segment star)
+    // 2) '/x/*' → '/x/:splat*'
     p = p.replace(/\/\*(?=\/|$)/g, () => `/:splat${splat++}*`);
 
-    // bare '*' or '/*'
+    // 3) bare '*' or '/*'
     if (p === "*" || p === "/*") p = "/:splat0(.*)";
 
-    // optional literal segment '(/bar)?'
+    // 4) '(/seg)?' → '/:opt(seg)?'
     p = p.replace(/\/\(([^)\/]+)\)\?/g, (_m, seg) => `/:opt${opt++}(${seg})?`);
 
-    // alternation '/(a|b)'
+    // 5) '/(a|b)' → '/:alt(a|b)'
     p = p.replace(/\/\(([^)]+?\|[^)]+?)\)/g, (_m, alts) => `/:alt${alt++}(${alts})`);
+
+    // 6) Final guard: escape *any* remaining '(' or ')' that are NOT part of ':param('…')'
+    //    This handles literal parentheses in URLs or exotic patterns v6 rejects.
+    //    We avoid touching things after a colon up to the matching ')'.
+    //    Simple safe heuristic: escape all '(' not preceded by ':' in the last 20 chars.
+    p = p.replace(/(\()|(\))/g, (m, lpar, rpar, idx) => {
+      if (lpar) {
+        const before = p.slice(Math.max(0, idx - 20), idx);
+        if (!/:\w*$/.test(before)) return "\\(";
+      }
+      if (rpar) {
+        // If it's closing a ':param(' we let it be; else escape.
+        // Quick check: is there an unclosed ':name(' nearby?
+        const before = p.slice(0, idx);
+        const after = p.slice(idx + 1);
+        const opened = (before.match(/:\w+\(/g) || []).length;
+        const closed = (before.match(/\)/g) || []).length;
+        if (opened <= closed) return "\\)";
+      }
+      return m;
+    });
 
     if (DEBUG && p !== original) console.log(`🔧 compat route: "${original}" → "${p}"`);
     return p;
   }
 
-  // Rewrite any number of leading "path-like" args until the first handler.
-  // path-like = string | RegExp | Array<string|RegExp>
   function rewriteLeadingPaths(args) {
     if (!args || !args.length) return args;
-
     const out = [];
     let i = 0;
-    // Collect & rewrite until first non-path-like (function/object/number/etc.)
     while (i < args.length) {
       const a = args[i];
       const isFn = typeof a === "function";
@@ -78,49 +75,44 @@ Debug: set COMPAT_ROUTE_DEBUG=1
         typeof a === "string" ||
         a instanceof RegExp ||
         (Array.isArray(a) && a.every(x => typeof x === "string" || x instanceof RegExp));
-
       if (!isPathLike || isFn) break;
 
       if (typeof a === "string") out.push(compatifyPath(a));
-      else if (Array.isArray(a)) {
-        out.push(a.map(x => (typeof x === "string" ? compatifyPath(x) : x)));
-      } else {
-        // RegExp untouched
-        out.push(a);
-      }
+      else if (Array.isArray(a)) out.push(a.map(x => (typeof x === "string" ? compatifyPath(x) : x)));
+      else out.push(a); // RegExp untouched
+
       i++;
     }
-
-    // push the rest unmodified
     for (; i < args.length; i++) out.push(args[i]);
     return out;
   }
 
-  // Patch a prototype with .use, all HTTP methods, and .route()
+  // 1) Patch Express public API on App & Router + .route()
+  const METHODS = [
+    "all","get","post","put","patch","delete","options","head",
+    "copy","lock","mkcol","move","purge","propfind","proppatch","search","trace",
+    "unlock","report","mkactivity","checkout","merge","m-search","notify",
+    "subscribe","unsubscribe","link","unlink"
+  ];
+
   function patchProto(proto) {
     if (!proto) return;
-
-    // .use
-    const origUse = proto.use;
-    if (typeof origUse === "function") {
+    if (typeof proto.use === "function") {
+      const origUse = proto.use;
       proto.use = function patchedUse(...args) {
         return origUse.apply(this, rewriteLeadingPaths(args));
       };
     }
-
-    // HTTP verbs
-    for (const m of HTTP_METHODS) {
-      const orig = proto[m];
-      if (typeof orig === "function") {
+    for (const m of METHODS) {
+      if (typeof proto[m] === "function") {
+        const orig = proto[m];
         proto[m] = function patchedMethod(...args) {
           return orig.apply(this, rewriteLeadingPaths(args));
         };
       }
     }
-
-    // .route(path)
-    const origRoute = proto.route;
-    if (typeof origRoute === "function") {
+    if (typeof proto.route === "function") {
+      const origRoute = proto.route;
       proto.route = function patchedRoute(pathArg, ...rest) {
         const p = typeof pathArg === "string" ? compatifyPath(pathArg) : pathArg;
         return origRoute.apply(this, [p, ...rest]);
@@ -128,34 +120,65 @@ Debug: set COMPAT_ROUTE_DEBUG=1
     }
   }
 
-  // Patch App and Router
   patchProto(express.application);
-  const Router = express.Router;
-  if (Router && Router.prototype) patchProto(Router.prototype);
-
-  // Also wrap the Router factory to ensure any fresh Router gets patched (defensive).
-  const origFactory = express.Router;
-  if (typeof origFactory === "function") {
-    express.Router = function patchedFactory(...args) {
-      const r = origFactory.apply(this, args);
-      patchProto(r); // instances are functions; patch its call signatures too
+  const OrigRouterFactory = express.Router;
+  if (OrigRouterFactory && OrigRouterFactory.prototype) patchProto(OrigRouterFactory.prototype);
+  if (typeof OrigRouterFactory === "function") {
+    express.Router = function patchedRouter(...args) {
+      const r = OrigRouterFactory.apply(this, args);
+      patchProto(r); // instance-level patch (defensive)
       return r;
     };
   }
 
-  if (DEBUG) console.log("🔧 Installed Express public-API compat shim (multi-path & .route supported)");
-})();
+  // 2) Last-mile safety: wrap router Layer ctor to sanitize & LOG offending path
+  let layerPath;
+  try { layerPath = __require.resolve("router/lib/layer.js"); }
+  catch { try { layerPath = __require.resolve("express/lib/router/layer.js"); } catch { layerPath = null; } }
 
-// ---- Local imports AFTER express shim ----
+  if (layerPath) {
+    __require(layerPath);
+    const cache = __require.cache[layerPath];
+    const OrigLayer = cache.exports;
+
+    function PatchedLayer(pathArg, options, fn) {
+      const raw = pathArg;
+      const safe = typeof raw === "string" ? compatifyPath(raw) : raw;
+      try {
+        return new OrigLayer(safe, options, fn);
+      } catch (e) {
+        // Log both raw & safe to pinpoint the bad pattern on remote logs.
+        console.error("⛔ Router Layer compile failed");
+        console.error("   raw:  ", raw);
+        console.error("   safe: ", safe);
+        throw e; // rethrow to preserve stack (Fly will show this)
+      }
+    }
+    // Preserve prototype/props
+    PatchedLayer.prototype = OrigLayer.prototype;
+    Object.setPrototypeOf(PatchedLayer, OrigLayer);
+    Object.defineProperties(PatchedLayer, Object.getOwnPropertyDescriptors(OrigLayer));
+
+    // Replace export
+    cache.exports = function LayerProxy(pathArg, options, fn) {
+      return PatchedLayer.call(this, pathArg, options, fn);
+    };
+    cache.exports.prototype = PatchedLayer.prototype;
+
+    if (DEBUG) console.log("🔧 Installed router Layer safety wrapper");
+  } else if (DEBUG) {
+    console.log("ℹ️ Layer module not found; API patch only");
+  }
+})();
+// ------------------ END COMPAT SHIM ------------------
+
 import { upload } from "./middleware/upload.js";
 import { initFirebase, putFile, statObject, getBucket } from "./lib/firebaseAdmin.js";
-
-// -----------------------------------------------------------------------------
 
 const app = express();
 app.set("trust proxy", 1);
 
-// ---- Firebase init ----
+// ---- Firebase ----
 try {
   initFirebase();
   console.log("✅ Firebase initialized");
@@ -181,10 +204,7 @@ app.use(
   cors({
     origin: function (origin, cb) {
       if (!origin) return cb(null, true);
-      if (
-        allowedOrigins.includes(origin) ||
-        allowedOrigins.some((o) => o instanceof RegExp && o.test(origin))
-      ) {
+      if (allowedOrigins.includes(origin) || allowedOrigins.some(o => o instanceof RegExp && o.test(origin))) {
         return cb(null, true);
       }
       console.error("❌ Blocked by CORS:", origin);
@@ -206,9 +226,7 @@ function sanitizeName(original = "file.bin") {
   return `${Date.now()}-${safe}${ext || ".bin"}`;
 }
 
-// -----------------------------------------------------------------------------
-// Firebase-backed uploads (catch-all) — Express v5-safe using :param(.*)
-// -----------------------------------------------------------------------------
+// ---- Upload proxy (catch-all) ----
 app.get("/uploads/:path(.*)", async (req, res) => {
   try {
     const rel = req.params?.path || "";
@@ -233,46 +251,26 @@ app.get("/uploads/:path(.*)", async (req, res) => {
   }
 });
 
-// ---- Health/diagnostics ----
+// ---- Health ----
 app.get("/healthz", (_req, res) => {
   const ok = Boolean(process.env.MONGO_URI) && Boolean(process.env.JWT_SECRET);
   const bucket = getBucket();
-  res.json({
-    ok,
-    mongoUriConfigured: Boolean(process.env.MONGO_URI),
-    jwtConfigured: Boolean(process.env.JWT_SECRET),
-    bucket: bucket?.name || null,
-  });
+  res.json({ ok, mongoUriConfigured: !!process.env.MONGO_URI, jwtConfigured: !!process.env.JWT_SECRET, bucket: bucket?.name || null });
 });
 
-app.get("/__diag/ping", async (_req, res) => {
-  try {
-    const bucket = getBucket();
-    res.json({ ok: true, bucket: bucket?.name || null });
-  } catch {
-    res.json({ ok: false });
-  }
+app.get("/__diag/ping", (_req, res) => {
+  try { res.json({ ok: true, bucket: getBucket()?.name || null }); }
+  catch { res.json({ ok: false }); }
 });
 
 app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "no file" });
     const filename = sanitizeName(req.file.originalname || "file.bin");
-
     let buffer = req.file.buffer;
     if (!buffer && req.file.path) buffer = fs.readFileSync(req.file.path);
-
-    await putFile({
-      filename,
-      buffer,
-      contentType: req.file.mimetype,
-    });
-
-    return res.json({
-      saved: true,
-      filename,
-      url: `/uploads/${filename}`,
-    });
+    await putFile({ filename, buffer, contentType: req.file.mimetype });
+    return res.json({ saved: true, filename, url: `/uploads/${filename}` });
   } catch (e) {
     console.error("⚠️ diag upload failed:", e?.message || e);
     return res.status(500).json({ error: "upload failed" });
@@ -281,49 +279,32 @@ app.post("/__diag/upload", upload.single("file"), async (req, res) => {
 
 app.get("/__diag/time", (_req, res) => {
   const now = new Date();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  res.json({
-    tz: process.env.TZ || "system-default",
-    nowISO: now.toISOString(),
-    startOfTodayISO: start.toISOString(),
-  });
+  const start = new Date(now); start.setHours(0,0,0,0);
+  res.json({ tz: process.env.TZ || "system-default", nowISO: now.toISOString(), startOfTodayISO: start.toISOString() });
 });
 
 // ---- Mongo ----
 if (!process.env.MONGO_URI) console.error("❌ MONGO_URI is not set");
 if (!process.env.JWT_SECRET) console.warn("⚠️ JWT_SECRET is not set");
 
-mongoose
-  .connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI)
   .then(async () => {
     console.log("✅ MongoDB connected");
-
-    // inventory index housekeeping
     try {
       const coll = mongoose.connection.db.collection("inventoryitems");
       const indexes = await coll.indexes();
-
-      const isSlugSingleField = (idx) =>
-        idx &&
-        idx.key &&
-        Object.keys(idx.key).length === 1 &&
-        Object.prototype.hasOwnProperty.call(idx.key, "slug");
-
+      const isSlugSingleField = (idx) => idx?.key && Object.keys(idx.key).length === 1 && Object.prototype.hasOwnProperty.call(idx.key, "slug");
       for (const idx of indexes) {
         if (idx.name === "_id_") continue;
         if (isSlugSingleField(idx) && idx.unique) continue;
-
         const keys = idx.key ? Object.keys(idx.key) : [];
         const referencesSkuOrName = keys.some((k) => /^(sku|name)/i.test(k));
         const nonUniqueSlugSingle = isSlugSingleField(idx) && !idx.unique;
-
         if (referencesSkuOrName || nonUniqueSlugSingle) {
           await coll.dropIndex(idx.name);
           console.log(`🧹 Dropped legacy index inventoryitems.${idx.name} (${JSON.stringify(idx.key)})`);
         }
       }
-
       const fresh = await coll.indexes();
       const hasUniqueSlug = fresh.some((i) => isSlugSingleField(i) && i.unique);
       if (!hasUniqueSlug) {
@@ -339,7 +320,7 @@ mongoose
     process.exit(1);
   });
 
-// ---- Routers (legacy wildcards auto-fixed by compat shim) ----
+// ---- Routers ----
 const { default: foodRoutes } = await import("./routes/foodRoutes.js");
 const { default: orderRoutes } = await import("./routes/orders.js");
 const { default: deliverymanRoutes } = await import("./routes/deliverymanRoutes.js");
@@ -352,7 +333,7 @@ const { default: emailRoutes } = await import("./routes/emailRoutes.js");
 const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
 
-// ---- Root + protected ----
+// Root + protected
 const appName = "Chicken & Rice API 🍚🍗";
 app.get("/", (_req, res) => res.json({ message: `Welcome to ${appName}` }));
 
@@ -365,7 +346,7 @@ app.get("/api/protected", (req, res) => {
   });
 });
 
-// ---- API routes ----
+// API routes
 app.use("/api/foods", foodRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/delivery", deliverymanRoutes);
@@ -378,7 +359,7 @@ app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
 app.use("/api/inventory", inventoryRoutes);
 
-// ---- Error handler ----
+// Error handler
 app.use((err, _req, res, _next) => {
   console.error("⚠️ Server error:", err?.message || err);
   res.status(500).json({ error: "Something went wrong" });
