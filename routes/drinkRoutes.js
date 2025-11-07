@@ -1,43 +1,59 @@
-// ============================================================================
 // backend/routes/drinkRoutes.js
-// ============================================================================
 import express from "express";
 import Drink from "../models/Drink.js";
 import { upload } from "../middleware/upload.js";
-import { putFile, deleteObject } from "../lib/firebaseAdmin.js";
+import { putFile } from "../lib/firebaseAdmin.js";
 
 const router = express.Router();
-const sanitize = (name = "file.bin") => {
-  const dot = name.lastIndexOf(".");
-  const base = (dot === -1 ? name : name.slice(0, dot)).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "file";
-  const ext = dot === -1 ? ".bin" : name.slice(dot).toLowerCase();
+const log = (...a) => console.log("[drinks]", ...a);
+const err = (...a) => console.error("[drinks]", ...a);
+
+function sanitizeName(original = "file.bin") {
+  const dot = original.lastIndexOf(".");
+  const ext = dot >= 0 ? original.slice(dot).toLowerCase() : ".bin";
+  const base = (dot >= 0 ? original.slice(0, dot) : original)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
   return `${Date.now()}-${base}${ext}`;
-};
-const makeKey = (prefix, originalname) => `${prefix}/${sanitize(originalname || "file.bin")}`;
+}
+
+async function saveToStorage(file, folder = "drinks") {
+  if (!file?.buffer || !file?.mimetype) throw new Error("Missing file buffer/mimetype");
+  const safe = sanitizeName(file.originalname || "image.jpg");
+  const key = `${folder}/${safe}`;
+  log("uploading →", key, `(${file.mimetype}, ${file.size || file.buffer.length} bytes)`);
+  await putFile({
+    filename: key,
+    buffer: file.buffer,
+    contentType: file.mimetype,
+    cacheControl: "public, max-age=31536000, immutable",
+  });
+  log("uploaded ✓", key);
+  return key;
+}
 
 router.post("/", upload.single("imageFile"), async (req, res) => {
   try {
-    console.log("📥 /api/drinks multipart:", {
-      fields: Object.fromEntries(Object.entries(req.body || {}).map(([k, v]) => [k, String(v).slice(0, 200)])),
-      file: req.file ? {
-        fieldname: req.file.fieldname, originalname: req.file.originalname,
-        mimetype: req.file.mimetype, size: req.file.size, hasBuffer: !!req.file.buffer
-      } : null,
-    });
+    log("POST / (fields):", req.body);
+    if (req.file) log("POST / (file):", { name: req.file.originalname, type: req.file.mimetype, size: req.file.size });
 
     const { name, price } = req.body;
-    let imagePath;
-    if (req.file?.buffer) {
-      const key = makeKey("drinks", req.file.originalname);
-      await putFile({ filename: key, buffer: req.file.buffer, contentType: req.file.mimetype });
-      imagePath = `/uploads/${key}`;
-    }
-    const drink = new Drink({ name, price, image: imagePath });
+    let key = null;
+    if (req.file) key = await saveToStorage(req.file, "drinks");
+
+    const drink = new Drink({
+      name,
+      price,
+      image: key ? `/uploads/${key}` : undefined,
+    });
+
     await drink.save();
+    log("POST / saved ✓", { id: drink._id, image: drink.image });
     res.status(201).json(drink);
-  } catch (err) {
-    console.error("❌ POST /drinks failed:", err?.message || err);
-    res.status(400).json({ error: err?.message || "Failed to save drink" });
+  } catch (e) {
+    err("POST / failed:", e?.message || e);
+    res.status(400).json({ error: e.message || "Failed to save drink" });
   }
 });
 
@@ -45,9 +61,9 @@ router.get("/", async (_req, res) => {
   try {
     const drinks = await Drink.find().sort({ createdAt: -1 });
     res.json(drinks);
-  } catch (err) {
-    console.error("GET /drinks error:", err?.message || err);
-    res.status(500).json({ error: err?.message || "Failed to fetch drinks" });
+  } catch (e) {
+    err("GET / failed:", e?.message || e);
+    res.status(500).json({ error: e.message || "Failed to fetch drinks" });
   }
 });
 
@@ -56,36 +72,33 @@ router.get("/:id", async (req, res) => {
     const drink = await Drink.findById(req.params.id);
     if (!drink) return res.status(404).json({ error: "Drink not found" });
     res.json(drink);
-  } catch (err) {
-    console.error("GET /drinks/:id error:", err?.message || err);
-    res.status(500).json({ error: err?.message || "Failed to fetch drink" });
+  } catch (e) {
+    err("GET /:id failed:", e?.message || e);
+    res.status(500).json({ error: e.message || "Failed to fetch drink" });
   }
 });
 
 router.put("/:id", upload.single("imageFile"), async (req, res) => {
   try {
-    console.log("📥 PUT /api/drinks/:id multipart:", {
-      id: req.params.id,
-      fields: Object.fromEntries(Object.entries(req.body || {}).map(([k, v]) => [k, String(v).slice(0, 200)])),
-      file: req.file ? {
-        fieldname: req.file.fieldname, originalname: req.file.originalname,
-        mimetype: req.file.mimetype, size: req.file.size, hasBuffer: !!req.file.buffer
-      } : null,
-    });
+    log("PUT /:id (fields):", req.body);
+    if (req.file) log("PUT /:id (file):", { name: req.file.originalname, type: req.file.mimetype, size: req.file.size });
 
     const { name, price } = req.body;
     const updates = { name, price };
-    if (req.file?.buffer) {
-      const key = makeKey("drinks", req.file.originalname);
-      await putFile({ filename: key, buffer: req.file.buffer, contentType: req.file.mimetype });
+
+    if (req.file) {
+      const key = await saveToStorage(req.file, "drinks");
       updates.image = `/uploads/${key}`;
     }
+
     const drink = await Drink.findByIdAndUpdate(req.params.id, updates, { new: true });
     if (!drink) return res.status(404).json({ error: "Drink not found" });
+
+    log("PUT /:id updated ✓", { id: drink._id, image: drink.image });
     res.json(drink);
-  } catch (err) {
-    console.error("❌ PUT /drinks/:id failed:", err?.message || err);
-    res.status(400).json({ error: err?.message || "Failed to update drink" });
+  } catch (e) {
+    err("PUT /:id failed:", e?.message || e);
+    res.status(400).json({ error: e.message || "Failed to update drink" });
   }
 });
 
@@ -93,11 +106,10 @@ router.delete("/:id", async (req, res) => {
   try {
     const drink = await Drink.findByIdAndDelete(req.params.id);
     if (!drink) return res.status(404).json({ error: "Drink not found" });
-    if (drink.image) await deleteObject(drink.image);
     res.json({ message: "Drink deleted" });
-  } catch (err) {
-    console.error("DELETE /drinks/:id error:", err?.message || err);
-    res.status(500).json({ error: err?.message || "Failed to delete drink" });
+  } catch (e) {
+    err("DELETE /:id failed:", e?.message || e);
+    res.status(500).json({ error: "Failed to delete drink" });
   }
 });
 
