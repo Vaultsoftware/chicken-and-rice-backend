@@ -23,7 +23,6 @@ const { default: express } = await import("express");
 const app = express();
 app.set("trust proxy", 1);
 
-// Build/version identifier (shows up in /__diag/version)
 const GIT_SHA =
   process.env.FLY_IMAGE_REF ||
   process.env.VERCEL_GIT_COMMIT_SHA ||
@@ -31,29 +30,32 @@ const GIT_SHA =
   process.env.RENDER_GIT_COMMIT ||
   "local-dev";
 
-// ---- Firebase init (awaited) ----
 try {
   await initFirebase();
-  const bucketName = (() => { try { return getBucket()?.name || null; } catch { return null; } })();
+  const bucketName = (() => {
+    try {
+      return getBucket()?.name || null;
+    } catch {
+      return null;
+    }
+  })();
   console.log(`✅ Firebase ready (bucket=${bucketName}) [build=${GIT_SHA}]`);
 } catch (e) {
   console.error("❌ Firebase init failed:", e?.message || e);
   process.exit(1);
 }
 
-// ---- Parsers ----
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ---- CORS ----
 const allowedOrigins = [
   "https://chickenandrice.net",
   "https://www.chickenandrice.net",
   /\.chickenandrice\.net$/i,
   "https://chickenandrice.vercel.app",
-  /\.vercel\.app$/i, // allow Vercel previews/custom subdomains
+  /\.vercel\.app$/i,
   "http://localhost:3000",
-  "http://127.0.0.1:3000",
+  "http://127.0.0.1:3000"
 ];
 app.use(
   cors({
@@ -68,15 +70,13 @@ app.use(
       console.error("❌ Blocked by CORS:", origin);
       return cb(new Error("Not allowed by CORS: " + origin));
     },
-    credentials: true,
+    credentials: true
   })
 );
 
-// ---- __dirname ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- Helpers ----
 function sanitizeName(original = "file.bin") {
   const ext = path.extname(original).toLowerCase() || ".bin";
   const base = path.basename(original, ext);
@@ -87,7 +87,6 @@ function sanitizeName(original = "file.bin") {
   return `${Date.now()}-${safe}${ext}`;
 }
 
-// ---- Optional storage readiness guard (keeps errors obvious) ----
 app.use((req, res, next) => {
   try {
     getBucket();
@@ -97,8 +96,6 @@ app.use((req, res, next) => {
   }
 });
 
-// ---- /uploads proxy → Firebase Storage ----
-// RegExp avoids path-to-regexp issues; capture is in req.params[0]
 app.get(/^\/uploads\/(.+)$/, async (req, res) => {
   try {
     const rel = req.params?.[0] || "";
@@ -126,7 +123,6 @@ app.get(/^\/uploads\/(.+)$/, async (req, res) => {
   }
 });
 
-// ---- Health & Diagnostics ----
 app.get("/healthz", (_req, res) => {
   let bucket = null;
   try {
@@ -136,7 +132,7 @@ app.get("/healthz", (_req, res) => {
     ok: !!(process.env.MONGO_URI && process.env.JWT_SECRET),
     mongoUriConfigured: !!process.env.MONGO_URI,
     jwtConfigured: !!process.env.JWT_SECRET,
-    bucket,
+    bucket
   });
 });
 
@@ -155,7 +151,7 @@ app.get("/__diag/time", (_req, res) => {
   res.json({
     tz: process.env.TZ || "system-default",
     nowISO: now.toISOString(),
-    startOfTodayISO: start.toISOString(),
+    startOfTodayISO: start.toISOString()
   });
 });
 
@@ -170,12 +166,11 @@ app.get("/__diag/version", (_req, res) => {
     bucket,
     env: {
       NODE_ENV: process.env.NODE_ENV,
-      PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
-    },
+      PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL
+    }
   });
 });
 
-// Check if a specific GCS key exists (useful when UI shows 404)
 app.get("/__diag/gcs/head", async (req, res) => {
   try {
     const key = String(req.query.key || "");
@@ -189,11 +184,12 @@ app.get("/__diag/gcs/head", async (req, res) => {
   }
 });
 
-// Upload test (raw file field name = "file")
 app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "no file" });
-    const filename = `diagnostics/${sanitizeName(req.file.originalname || "file.bin")}`;
+    const filename = `diagnostics/${sanitizeName(
+      req.file.originalname || "file.bin"
+    )}`;
     let buffer = req.file.buffer;
     if (!buffer && req.file.path) buffer = fs.readFileSync(req.file.path);
     await putFile({ filename, buffer, contentType: req.file.mimetype });
@@ -204,7 +200,6 @@ app.post("/__diag/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Echo exactly what Multer receives (field name "imageFile" like your forms)
 app.post("/__diag/multipart", upload.single("imageFile"), async (req, res) => {
   res.json({
     fields: req.body || {},
@@ -214,13 +209,12 @@ app.post("/__diag/multipart", upload.single("imageFile"), async (req, res) => {
           originalname: req.file.originalname,
           mimetype: req.file.mimetype,
           size: req.file.size,
-          hasBuffer: !!req.file.buffer,
+          hasBuffer: !!req.file.buffer
         }
-      : null,
+      : null
   });
 });
 
-// ---- Mongo ----
 if (!process.env.MONGO_URI) console.error("❌ MONGO_URI is not set");
 if (!process.env.JWT_SECRET) console.warn("⚠️ JWT_SECRET is not set");
 
@@ -281,7 +275,7 @@ const { default: emailRoutes } = await import("./routes/emailRoutes.js");
 const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
 const { default: uploadRoutes } = await import("./routes/uploadRoutes.js");
-const { default: facebookRoutes} = await import("./routes/facebook.js");
+const { default: facebookRoutes } = await import("./routes/facebook.js");
 
 // ---- Root + protected ----
 const appName = "Chicken & Rice API 🍚🍗";
@@ -308,9 +302,8 @@ app.use("/api/proteinpop", proteinPopRoutes);
 app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
 app.use("/api/inventory", inventoryRoutes);
-app.use("/api", uploadRoutes); // exposes POST /api/upload
-// ✅ Match frontend path
-app.use("/api/facebook", facebookRoutes);
+app.use("/api", uploadRoutes);
+app.use("/api/facebook", facebookRoutes); // ✅ matches frontend
 
 // ---- Error handler ----
 app.use((err, _req, res, _next) => {
