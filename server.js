@@ -1,7 +1,6 @@
 // ============================================================================
-// backend/server.js
+// File: backend/server.js
 // ============================================================================
-
 import "dotenv/config";
 process.env.TZ = process.env.TZ || process.env.INVENTORY_TZ || "Africa/Lagos";
 
@@ -283,7 +282,6 @@ const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
 const { default: uploadRoutes } = await import("./routes/uploadRoutes.js");
 const { default: facebookRoutes} = await import("./routes/facebook.js");
-// import facebookRoutes from './routes/facebook.js';
 
 // ---- Root + protected ----
 const appName = "Chicken & Rice API 🍚🍗";
@@ -311,7 +309,8 @@ app.use("/api/email", emailRoutes);
 app.use("/api/drinks", drinkRoutes);
 app.use("/api/inventory", inventoryRoutes);
 app.use("/api", uploadRoutes); // exposes POST /api/upload
-app.use("/facebook", facebookRoutes); 
+// ✅ Match frontend path
+app.use("/api/facebook", facebookRoutes);
 
 // ---- Error handler ----
 app.use((err, _req, res, _next) => {
