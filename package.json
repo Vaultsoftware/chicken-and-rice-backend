@@ -23,7 +23,8 @@
     "mongoose": "^8.17.0",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
-    "nodemailer": "^7.0.5"
+    "nodemailer": "^7.0.5",
+    "sharp": "^0.33.5"
   },
   "devDependencies": {
     "@flydotio/dockerfile": "^0.7.10",

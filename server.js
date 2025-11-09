@@ -276,6 +276,7 @@ const { default: drinkRoutes } = await import("./routes/drinkRoutes.js");
 const { default: inventoryRoutes } = await import("./routes/inventory.js");
 const { default: uploadRoutes } = await import("./routes/uploadRoutes.js");
 const { default: facebookRoutes } = await import("./routes/facebook.js");
+const { default: imgRoutes }  = await import("./routes/img.js"); // ✅ NEW
 
 // ---- Root + protected ----
 const appName = "Chicken & Rice API 🍚🍗";
@@ -291,6 +292,7 @@ app.get("/api/protected", (req, res) => {
 });
 
 // ---- API routes ----
+app.use("/img", imgRoutes);                 // ✅ NEW: image optimizer
 app.use("/api/foods", foodRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/delivery", deliverymanRoutes);
