@@ -34,6 +34,13 @@ async function saveToStorage(file, folder = "foods") {
   return key;
 }
 
+const toBool = (v) =>
+  v === true || v === 1 || v === "1" || String(v).toLowerCase() === "true";
+const toNum = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+
 // list
 router.get("/", async (req, res) => {
   try {
@@ -88,6 +95,7 @@ router.post("/", upload.single("imageFile"), async (req, res) => {
 
     const {
       name, description, price, category, isAvailable, isPopular, state, lgas,
+      isBulk, bulkInitialQty,
     } = req.body;
 
     let key = null;
@@ -98,15 +106,18 @@ router.post("/", upload.single("imageFile"), async (req, res) => {
       description,
       price,
       category,
-      isAvailable: isAvailable === "true" || isAvailable === true,
-      isPopular: isPopular === "true" || isPopular === true,
+      isAvailable: toBool(isAvailable),
+      isPopular: toBool(isPopular),
       state,
       lgas: lgas ? JSON.parse(lgas) : [],
       image: key ? `/uploads/${key}` : null,
+      // ✅ bulk
+      isBulk: toBool(isBulk),
+      bulkInitialQty: Math.max(1, toNum(bulkInitialQty, 25)),
     });
 
     await food.save();
-    log("POST / saved ✓", { id: food._id, image: food.image });
+    log("POST / saved ✓", { id: food._id, image: food.image, isBulk: food.isBulk, bulkInitialQty: food.bulkInitialQty });
     res.status(201).json(food);
   } catch (e) {
     err("POST / failed:", e?.message || e);
@@ -121,6 +132,7 @@ router.put("/:id", upload.single("imageFile"), async (req, res) => {
 
     const {
       name, description, price, category, isAvailable, isPopular, state, lgas,
+      isBulk, bulkInitialQty,
     } = req.body;
 
     const update = {
@@ -128,10 +140,12 @@ router.put("/:id", upload.single("imageFile"), async (req, res) => {
       description,
       price,
       category,
-      isAvailable: isAvailable === "true" || isAvailable === true,
-      isPopular: isPopular === "true" || isPopular === true,
+      isAvailable: toBool(isAvailable),
+      isPopular: toBool(isPopular),
       state,
       lgas: lgas ? JSON.parse(lgas) : [],
+      isBulk: toBool(isBulk),
+      bulkInitialQty: Math.max(1, toNum(bulkInitialQty, 25)),
     };
 
     if (req.file) {
@@ -142,7 +156,7 @@ router.put("/:id", upload.single("imageFile"), async (req, res) => {
     const food = await Food.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!food) return res.status(404).json({ error: "Food not found" });
 
-    log("PUT /:id updated ✓", { id: food._id, image: food.image });
+    log("PUT /:id updated ✓", { id: food._id, image: food.image, isBulk: food.isBulk, bulkInitialQty: food.bulkInitialQty });
     res.json(food);
   } catch (e) {
     err("PUT /:id failed:", e?.message || e);
